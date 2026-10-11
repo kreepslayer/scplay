@@ -1,0 +1,1900 @@
+#!/usr/bin/env python3
+"""scplay — SoundCloud в терминале: поиск, лайки, плейлисты, визуализатор и волна.
+
+Зависимости:
+    pip install yt-dlp textual numpy python-mpv-jsonipc
+    + программы mpv и ffmpeg в PATH
+
+Запуск:
+    python scplay.py                    # открыть интерфейс
+    python scplay.py lofi hip hop       # сразу поиск
+    python scplay.py <ссылка>           # сразу играть трек / плейлист
+    python scplay.py song.mp3           # или локальный файл
+
+Вход в аккаунт: залогинься на soundcloud.com в браузере, затем в программе нажми L
+и введи название браузера (firefox, chrome, edge, brave ...).
+"""
+
+from __future__ import annotations
+
+import atexit
+import json
+import os
+import random
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+
+for _exe in ("mpv", "ffmpeg"):
+    if not shutil.which(_exe):
+        sys.exit(
+            f"Не найден {_exe}. Установи его и добавь в PATH "
+            f"(brew install {_exe} / apt install {_exe} / winget install {_exe})."
+        )
+
+try:
+    import numpy as np
+    import yt_dlp
+    from python_mpv_jsonipc import MPV
+    from rich.text import Text
+    from textual import events, work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.widget import Widget
+    from textual.widgets import DataTable, Input
+except ImportError as e:  # pragma: no cover
+    sys.exit(
+        f"Не хватает пакета: {e.name}\n"
+        "Установи:  pip install yt-dlp textual numpy python-mpv-jsonipc"
+    )
+
+CONFIG_PATH = Path.home() / ".config" / "scplay" / "config.json"
+MPV_LOG = CONFIG_PATH.parent / "mpv.log"
+
+SR = 16000  # частота дискретизации для анализа (моно)
+FFT_N = 2048  # окно спектра
+BLK = 160  # размер блока для огибающей волны (10 мс)
+HANN = np.hanning(FFT_N).astype(np.float32)
+BLOCKS = " ▁▂▃▄▅▆▇█"
+THEMES = {
+    "mocha": dict(
+        bg="#1e1e2e",
+        surface="#313244",
+        line="#45475a",
+        text="#cdd6f4",
+        dim="#9399b2",
+        faint="#6c7086",
+        accent="#89b4fa",
+        accent2="#cba6f7",
+        ok="#a6e3a1",
+        err="#f38ba8",
+    ),
+    "nord": dict(
+        bg="#2e3440",
+        surface="#3b4252",
+        line="#4c566a",
+        text="#d8dee9",
+        dim="#9aa5b8",
+        faint="#667189",
+        accent="#88c0d0",
+        accent2="#b48ead",
+        ok="#a3be8c",
+        err="#bf616a",
+    ),
+    "gruvbox": dict(
+        bg="#282828",
+        surface="#3c3836",
+        line="#504945",
+        text="#ebdbb2",
+        dim="#a89984",
+        faint="#7c6f64",
+        accent="#83a598",
+        accent2="#d3869b",
+        ok="#b8bb26",
+        err="#fb4934",
+    ),
+    "rosepine": dict(
+        bg="#191724",
+        surface="#26233a",
+        line="#403d52",
+        text="#e0def4",
+        dim="#908caa",
+        faint="#6e6a86",
+        accent="#9ccfd8",
+        accent2="#c4a7e7",
+        ok="#f6c177",
+        err="#eb6f92",
+    ),
+}
+
+VIEWS = ["search", "likes", "sets", "mine", "queue"]
+TAB_NAMES = ["Поиск", "Лайки", "Плейлисты", "Мои треки", "Очередь"]
+REPEAT_NAMES = ["выкл", "все", "один"]
+
+# Режимы запуска mpv: по очереди, пока один не заработает.
+MPV_BASE = [
+    "--idle=yes",
+    "--no-input-terminal",
+    "--msg-level=all=error",
+    "--term-status-msg=",
+    "--force-window=no",
+    "--no-video",
+    "--ytdl=no",
+]
+MPV_PROFILES = [
+    ("изолированный", ["--no-config", "--load-scripts=no", "--osc=no"]),
+    ("без видео-вывода", ["--no-config", "--load-scripts=no", "--osc=no", "--vo=null"]),
+    ("с вашим конфигом", []),
+]
+
+KEYS = [
+    ("Пробел", "пауза"),
+    ("←/→", "перемотка"),
+    ("n/b", "дальше/назад"),
+    ("+/-", "громкость"),
+    ("s", "шаффл"),
+    ("r", "повтор"),
+    ("Enter", "играть"),
+    ("a", "в очередь"),
+    ("d", "убрать"),
+    ("/", "поиск"),
+    ("1-5", "вкладки"),
+    ("L", "вход"),
+    ("t", "тема"),
+    ("q", "выход"),
+]
+
+
+# ---------------------------------------------------------------- утилиты
+
+
+def fmt(sec) -> str:
+    if not sec or sec < 0:
+        return "0:00"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def lerp_hex(c1: str, c2: str, t: float) -> str:
+    a = [int(c1[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in zip(a, b))
+
+
+def clip(s: str, n: int) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[: max(n - 1, 0)] + "…"
+
+
+class _NullLogger:
+    def debug(self, *a):
+        pass
+
+    def info(self, *a):
+        pass
+
+    def warning(self, *a):
+        pass
+
+    def error(self, *a):
+        pass
+
+
+def load_cfg() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cfg(cfg: dict) -> None:
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.chmod(CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def auth_opts(cfg: dict) -> dict:
+    if cfg.get("cookiefile"):
+        return {"cookiefile": cfg["cookiefile"]}
+    if cfg.get("browser"):
+        return {"cookiesfrombrowser": (cfg["browser"],)}
+    return {}
+
+
+def ydl_base(cfg: dict, **extra) -> dict:
+    return {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _NullLogger(),
+        "skip_download": True,
+        **auth_opts(cfg),
+        **extra,
+    }
+
+
+def norm_entry(e: dict) -> dict:
+    url = e.get("url") or e.get("webpage_url") or ""
+    return {
+        "title": e.get("title") or "?",
+        "uploader": e.get("uploader") or e.get("channel") or "",
+        "duration": e.get("duration"),
+        "url": url,
+        "kind": "playlist" if "/sets/" in url else "track",
+    }
+
+
+def extract_list(target: str, cfg: dict, n: int = 50) -> list[dict]:
+    with yt_dlp.YoutubeDL(ydl_base(cfg, extract_flat=True, playlistend=n)) as ydl:
+        info = ydl.extract_info(target, download=False)
+    entries = info.get("entries") if info else None
+    if entries is None and info:  # одиночный трек
+        return [norm_entry(info)]
+    return [
+        norm_entry(e)
+        for e in (entries or [])
+        if e and (e.get("url") or e.get("webpage_url"))
+    ]
+
+
+def api_item(it: dict) -> dict | None:
+    """Элемент ответа API SoundCloud (трек или плейлист) -> запись списка."""
+    url = it.get("permalink_url")
+    if not url:
+        return None
+    dur = it.get("full_duration") or it.get("duration")
+    return {
+        "title": it.get("title") or "?",
+        "uploader": (it.get("user") or {}).get("username") or "",
+        "duration": (dur / 1000.0) if dur else None,
+        "url": url,
+        "kind": (
+            "playlist" if it.get("kind") == "playlist" or "/sets/" in url else "track"
+        ),
+    }
+
+
+def _sc_ie(ydl, key: str):
+    ie = ydl.get_info_extractor(key)
+    ie.set_downloader(ydl)
+    ie.initialize()
+    return ie
+
+
+def profile_list(cfg: dict, kind: str, n: int = 100) -> list[dict]:
+    """Лайки / плейлисты / треки профиля сразу с автором и длительностью."""
+    endpoint = {
+        "likes": "users/%s/likes",
+        "sets": "users/%s/playlists",
+        "mine": "users/%s/tracks",
+    }[kind]
+    with yt_dlp.YoutubeDL(ydl_base(cfg)) as ydl:
+        ie = _sc_ie(ydl, "SoundcloudUser")
+        user = ie._download_json(
+            ie._resolv_url(cfg["profile"]), "user", headers=ie._HEADERS
+        )
+        url = ie._API_V2_BASE + endpoint % user["id"]
+        query = {"limit": min(n, 200), "linked_partitioning": "1", "offset": 0}
+        out: list[dict] = []
+        while url and len(out) < n:
+            resp = ie._download_json(url, "list", query=query, headers=ie._HEADERS)
+            for e in resp.get("collection") or []:
+                if not isinstance(e, dict):
+                    continue
+                rec = api_item(e.get("track") or e.get("playlist") or e)
+                if rec:
+                    out.append(rec)
+            url = resp.get("next_href")
+            query.pop("offset", None)
+    return out[:n]
+
+
+def playlist_tracks(cfg: dict, url: str) -> list[dict]:
+    """Треки плейлиста с названиями и авторами (yt-dlp в плоском режиме их не отдаёт)."""
+    with yt_dlp.YoutubeDL(ydl_base(cfg)) as ydl:
+        ie = _sc_ie(ydl, "SoundcloudSet")
+        info = ie._download_json(ie._resolv_url(url), "set", headers=ie._HEADERS)
+        tracks = info.get("tracks") or []
+        missing = [str(t["id"]) for t in tracks if t.get("id") and not t.get("title")]
+        fetched: dict = {}
+        for i in range(0, len(missing), 50):
+            data = ie._download_json(
+                ie._API_V2_BASE + "tracks",
+                "tracks",
+                query={"ids": ",".join(missing[i : i + 50])},
+                headers=ie._HEADERS,
+            )
+            for d in data or []:
+                fetched[d.get("id")] = d
+    recs = [api_item(fetched.get(t.get("id"), t)) for t in tracks]
+    return [r for r in recs if r]
+
+
+def get_tracks(cfg: dict, url: str, n: int = 200) -> list[dict]:
+    if "/sets/" in url:
+        try:
+            recs = playlist_tracks(cfg, url)
+            if recs:
+                return recs
+        except Exception:
+            pass
+    return extract_list(url, cfg, n)
+
+
+def resolve_stream(track: dict, cfg: dict) -> dict:
+    """Возвращает {'url': прямая ссылка на аудио, 'duration': сек}."""
+    if os.path.exists(track["url"]):
+        return {"url": track["url"], "duration": track.get("duration")}
+    with yt_dlp.YoutubeDL(ydl_base(cfg, format="bestaudio/best")) as ydl:
+        info = ydl.extract_info(track["url"], download=False)
+    if info.get("entries"):
+        raise RuntimeError("это плейлист, а не трек")
+    return {
+        "url": info["url"],
+        "duration": info.get("duration") or track.get("duration"),
+    }
+
+
+def get_token(auth: dict):
+    try:
+        with yt_dlp.YoutubeDL(ydl_base({}, **auth)) as ydl:
+            for c in ydl.cookiejar:
+                if c.name == "oauth_token" and "soundcloud.com" in c.domain:
+                    return c.value, None
+    except Exception as e:
+        return None, str(e)
+    return None, None
+
+
+def fetch_me(token: str):
+    try:
+        with yt_dlp.YoutubeDL(ydl_base({})) as ydl:
+            ie = ydl.get_info_extractor("Soundcloud")
+            ie.set_downloader(ydl)
+            ie._update_client_id()
+            cid = ie._CLIENT_ID
+        req = urllib.request.Request(
+            f"https://api-v2.soundcloud.com/me?client_id={cid}",
+            headers={"Authorization": f"OAuth {token}", "User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- анализатор звука
+
+
+class Analyzer:
+    """Декодирует трек через ffmpeg в моно-PCM и считает спектр/волну для любой позиции."""
+
+    def __init__(self, src: str, duration: float | None):
+        self.lock = threading.Lock()
+        cap = int((duration or 600) * SR) + SR * 10
+        self.data = np.zeros(cap, np.int16)
+        self.env = np.zeros(cap // BLK + 8, np.float32)
+        self.n = 0
+        self.nbd = 0
+        self.done = False
+        self.proc = None
+        self._stop = False
+        self._wkey = None
+        self._wval = None
+        self._bands: dict = {}
+        threading.Thread(target=self._run, args=(src,), daemon=True).start()
+
+    def _run(self, src: str) -> None:
+        try:
+            self.proc = subprocess.Popen(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-i",
+                    src,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    str(SR),
+                    "-f",
+                    "s16le",
+                    "pipe:1",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=clean_env(),
+            )
+            rem = b""
+            while not self._stop:
+                chunk = self.proc.stdout.read(65536)
+                if not chunk:
+                    break
+                chunk = rem + chunk
+                k = len(chunk) // 2 * 2
+                rem = chunk[k:]
+                arr = np.frombuffer(chunk[:k], dtype="<i2")
+                with self.lock:
+                    need = self.n + len(arr)
+                    if need > len(self.data):
+                        cap = max(len(self.data) * 2, need + SR)
+                        nd = np.zeros(cap, np.int16)
+                        nd[: self.n] = self.data[: self.n]
+                        ne = np.zeros(cap // BLK + 8, np.float32)
+                        ne[: self.nbd] = self.env[: self.nbd]
+                        self.data, self.env = nd, ne
+                    self.data[self.n : need] = arr
+                    self.n = need
+                    total_blocks = self.n // BLK
+                    if total_blocks > self.nbd:
+                        seg = np.abs(
+                            self.data[self.nbd * BLK : total_blocks * BLK].astype(
+                                np.int32
+                            )
+                        )
+                        self.env[self.nbd : total_blocks] = seg.reshape(-1, BLK).max(
+                            axis=1
+                        )
+                        self.nbd = total_blocks
+        except Exception:
+            pass
+        finally:
+            self.done = True
+
+    def stop(self) -> None:
+        self._stop = True
+        try:
+            if self.proc and self.proc.poll() is None:
+                self.proc.kill()
+        except Exception:
+            pass
+
+    def _band_tables(self, nb: int):
+        if nb not in self._bands:
+            edges = np.geomspace(60, 7800, nb + 1)
+            bw = SR / FFT_N
+            lo = np.maximum((edges[:-1] / bw).astype(int), 1)
+            hi = np.maximum((edges[1:] / bw).astype(int), lo + 1)
+            centers = np.sqrt(edges[:-1] * edges[1:])
+            tilt = (3.0 * np.log2(centers / 200.0)).astype(np.float32)
+            self._bands[nb] = (lo, hi, tilt)
+        return self._bands[nb]
+
+    def spectrum(self, t: float, nb: int):
+        """Уровни 0..1 для nb полос в момент t; None, если эта часть ещё не декодирована."""
+        i = int(t * SR)
+        with self.lock:
+            data, n = self.data, self.n
+        if i < 0 or i >= n:
+            return None
+        half = FFT_N // 2
+        a, b = i - half, i + half
+        if a < 0 or b > n:
+            seg = np.zeros(FFT_N, np.float32)
+            lo, hi = max(a, 0), min(b, n)
+            seg[lo - a : hi - a] = data[lo:hi]
+        else:
+            seg = data[a:b].astype(np.float32)
+        mag = np.abs(np.fft.rfft(seg / 32768.0 * HANN)) / (HANN.sum() / 2)
+        lo, hi, tilt = self._band_tables(nb)
+        vals = np.array([mag[l:h].max() for l, h in zip(lo, hi)])
+        db = 20 * np.log10(vals + 1e-7) + tilt
+        return np.clip((db + 84) / 60, 0, 1)
+
+    def wave(self, cols: int, total_sec: float):
+        """Пики волны по колонкам (0..1) для всего трека; недекодированное = 0."""
+        with self.lock:
+            env, nbd = self.env, self.nbd
+        key = (cols, int(total_sec), nbd // 300 if not self.done else -1)
+        if key == self._wkey:
+            return self._wval
+        total_blocks = total_sec * SR / BLK if total_sec else float(max(nbd, 1))
+        edges = (np.linspace(0, total_blocks, cols + 1)).astype(np.int64)
+        out = np.zeros(cols, np.float32)
+        valid = edges[:-1] < nbd
+        k = int(valid.sum())
+        if k:
+            out[:k] = np.maximum.reduceat(env[:nbd], edges[:-1][valid])
+            ref = float(np.percentile(out[:k], 97)) or 1.0
+            out = np.clip(out / ref, 0, 1)
+        self._wkey, self._wval = key, out
+        return out
+
+
+STRIP_ENV = sys.platform == "darwin"
+
+
+def clean_env() -> dict:
+    """Окружение без DYLD_*: на macOS из-за них системные фреймворки (ImageIO и др.)
+    могут подхватить чужие библиотеки и уронить mpv ещё до запуска (SIGBUS)."""
+    if not STRIP_ENV:
+        return dict(os.environ)
+    return {k: v for k, v in os.environ.items() if not k.startswith("DYLD_")}
+
+
+def describe_exit(rc: int) -> str:
+    if rc < 0:
+        try:
+            return f"аварийно, сигнал {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"аварийно, сигнал {-rc}"
+    return f"код {rc}"
+
+
+def diagnose() -> None:
+    """scplay.py --diagnose — проверка mpv/ffmpeg и режимов запуска."""
+    print(f"python {platform.python_version()} · {platform.platform()}")
+    dyld = {k: v for k, v in os.environ.items() if k.startswith("DYLD_")}
+    print(
+        "\n[окружение] "
+        + (
+            ", ".join(f"{k}={v}" for k, v in dyld.items())
+            if dyld
+            else "переменных DYLD_* нет"
+        )
+    )
+    minimal = {
+        "HOME": str(Path.home()),
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    }
+    for exe in ("mpv", "ffmpeg"):
+        path = shutil.which(exe)
+        print(f"\n[{exe}] {path or 'НЕ НАЙДЕН'}")
+        if not path:
+            continue
+        flag = "-version" if exe == "ffmpeg" else "--version"
+
+        def run_ver(env):
+            try:
+                r = subprocess.run(
+                    [path, flag], capture_output=True, text=True, timeout=15, env=env
+                )
+                first = (r.stdout or r.stderr).strip().splitlines()[:1]
+                return r.returncode, (first[0] if first else "?")
+            except Exception as e:
+                return 255, str(e)
+
+        rc, line = run_ver(dict(os.environ))
+        print(f"  версия: {line}  ({describe_exit(rc)})")
+        if rc != 0:
+            rc2, line2 = run_ver(clean_env())
+            rc3, line3 = run_ver(minimal)
+            print(
+                f"  без DYLD_*: {describe_exit(rc2)} · с минимальным окружением: {describe_exit(rc3)}"
+            )
+            if rc2 == 0 or rc3 == 0:
+                print(
+                    "  !! в чистом окружении работает — виновата переменная окружения "
+                    "(проверь ~/.zshrc, ~/.zprofile, ~/.zshenv: grep -n DYLD ~/.z*)"
+                )
+            else:
+                print(
+                    "  !! падает и в чистом окружении: переустанови (macOS: brew reinstall "
+                    + exe
+                    + ")"
+                )
+    cfg_dirs = [
+        Path.home() / ".config" / "mpv",
+        Path.home() / ".mpv",
+        Path.home() / "Library" / "Preferences" / "io.mpv",
+    ]
+    found = [d for d in cfg_dirs if d.exists()]
+    print("\n[конфиг mpv] " + (", ".join(map(str, found)) if found else "не найден"))
+    for d in found:
+        for p in sorted(d.glob("**/*"))[:12]:
+            if p.is_file():
+                print("   ", p.relative_to(d))
+    mpv = shutil.which("mpv")
+    if not mpv:
+        return
+    print("\n[режимы запуска mpv] (ждём 2.5 с, без подключения)")
+    for name, extra in MPV_PROFILES:
+        sock = (
+            f"/tmp/scplay-diag-{os.getpid()}.sock"
+            if os.name != "nt"
+            else f"scplay-diag-{os.getpid()}"
+        )
+        cmd = [mpv, *MPV_BASE, *extra, f"--input-ipc-server={sock}"]
+        try:
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=clean_env(),
+            )
+            time.sleep(2.5)
+            rc = p.poll()
+            if rc is None:
+                print(f"  {name}: OK (работает)")
+                p.terminate()
+                p.wait(3)
+            else:
+                out = (p.stdout.read() or "").strip().splitlines()
+                print(
+                    f"  {name}: упал — {describe_exit(rc)}"
+                    + (f" · {out[-1]}" if out else "")
+                )
+        except Exception as e:
+            print(f"  {name}: ошибка {e}")
+
+    print(
+        "\n[тест по шагам: подключение → воспроизведение файла → поток SoundCloud] (звук выключен)"
+    )
+
+    def step(title, fn):
+        try:
+            res = fn()
+            print(f"  ✓ {title}" + (f": {res}" if res else ""))
+            return True
+        except Exception as e:
+            print(f"  ✗ {title}: {e}")
+            return False
+
+    # 1) сырое подключение к IPC без нашей библиотеки (только Unix)
+    if os.name != "nt":
+        import socket
+
+        sock = f"/tmp/scplay-diag2-{os.getpid()}.sock"
+        p = subprocess.Popen(
+            [
+                mpv,
+                *MPV_BASE,
+                *MPV_PROFILES[0][1],
+                "--volume=0",
+                f"--input-ipc-server={sock}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=clean_env(),
+        )
+        try:
+            for _ in range(50):
+                if os.path.exists(sock) or p.poll() is not None:
+                    break
+                time.sleep(0.1)
+
+            def raw_ipc():
+                c = socket.socket(socket.AF_UNIX)
+                c.settimeout(5)
+                c.connect(sock)
+                c.sendall(b'{"command":["get_property","mpv-version"]}\n')
+                data = c.recv(4096).decode(errors="replace").strip()
+                time.sleep(0.5)
+                if p.poll() is not None:
+                    raise RuntimeError(
+                        "mpv упал после подключения: " + describe_exit(p.returncode)
+                    )
+                return data[:80]
+
+            step("сырое подключение к IPC-сокету mpv", raw_ipc)
+        finally:
+            if p.poll() is None:
+                p.terminate()
+
+    # 2) настоящий путь запуска из программы
+    app = ScPlay()
+    app.volume = 0
+    holder = {}
+
+    def start():
+        m, err = app._spawn_mpv()
+        if not m:
+            raise RuntimeError(err)
+        holder["m"] = m
+        return f"режим «{app.mpv_profile}»"
+
+    if not step("запуск mpv как в программе + подключение библиотеки", start):
+        print("\nПришли этот вывод и, если есть, файл", MPV_LOG)
+        return
+    m = holder["m"]
+    proc = app.mpv_proc
+
+    def alive():
+        if proc.poll() is not None:
+            raise RuntimeError("mpv упал: " + describe_exit(proc.returncode))
+
+    def getp(name):
+        try:
+            return m.command("get_property", name)
+        except Exception:
+            return None
+
+    step("команда get_property", lambda: str(getp("mpv-version")))
+    alive()
+
+    def play_local():
+        wav = Path(os.environ.get("TMPDIR", "/tmp")) / f"scplay_diag_{os.getpid()}.wav"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+                "-ar",
+                "22050",
+                str(wav),
+            ],
+            check=True,
+            timeout=20,
+        )
+        m.command("loadfile", str(wav), "replace")
+        time.sleep(2.5)
+        alive()
+        pos = getp("time-pos")
+        if not pos:
+            raise RuntimeError(f"позиция не идёт (time-pos={pos})")
+        return f"играет, позиция {float(pos):.1f} с"
+
+    ok_local = step("воспроизведение локального файла", play_local)
+
+    def play_stream():
+        cfg = load_cfg()
+        items = extract_list("scsearch1:ambient", cfg, 1)
+        if not items:
+            raise RuntimeError("поиск SoundCloud ничего не вернул")
+        info = resolve_stream(items[0], cfg)
+        kind = "HLS" if ".m3u8" in info["url"] else "прямой"
+        m.command("loadfile", info["url"], "replace")
+        time.sleep(6)
+        alive()
+        pos = getp("time-pos")
+        if not pos:
+            raise RuntimeError(f"поток ({kind}) не заиграл (time-pos={pos})")
+        return f"{kind} поток играет, позиция {float(pos):.1f} с"
+
+    step("поток SoundCloud (поиск → ссылка → mpv)", play_stream)
+
+    # анализатор (ffmpeg) на локальном файле
+    def analyzer_test():
+        wav = Path(os.environ.get("TMPDIR", "/tmp")) / f"scplay_diag_{os.getpid()}.wav"
+        a = Analyzer(str(wav), 6)
+        for _ in range(30):
+            if a.done:
+                break
+            time.sleep(0.1)
+        n = a.n
+        a.stop()
+        if n < 1000:
+            raise RuntimeError(f"ffmpeg декодировал только {n} сэмплов")
+        return f"{n} сэмплов"
+
+    if ok_local:
+        step("анализатор (ffmpeg → numpy) для визуализатора", analyzer_test)
+    app.stop_mpv()
+    print("\nПришли этот вывод целиком — по нему будет видно, на каком шаге падает.")
+
+
+# ---------------------------------------------------------------- виджеты
+
+
+class Live(Widget):
+    """Виджет, который рисуется функцией fn(width, height) -> Text."""
+
+    def __init__(self, fn, on_click=None, **kw):
+        super().__init__(**kw)
+        self.fn = fn
+        self.click_fn = on_click
+
+    def render(self):
+        w, h = self.size.width, self.size.height
+        if w < 1 or h < 1:
+            return Text("")
+        return self.fn(w, h)
+
+    def on_click(self, event: events.Click) -> None:
+        if self.click_fn:
+            self.click_fn(event.x, self.size.width)
+
+
+class KeyBar(Live):
+    def on_resize(self, event: events.Resize) -> None:
+        n = len(self.app.layout_keys(max(event.size.width, 20)))
+        if getattr(self, "_n", None) != n:
+            self._n = n
+            self.styles.height = n
+
+
+# ---------------------------------------------------------------- приложение
+
+
+class ScPlay(App):
+    CSS = """
+    Screen { background: $sc-bg; color: $sc-text; }
+    * {
+        scrollbar-size-vertical: 1;
+        scrollbar-background: $sc-bg; scrollbar-background-hover: $sc-bg; scrollbar-background-active: $sc-bg;
+        scrollbar-color: $sc-line; scrollbar-color-hover: $sc-faint; scrollbar-color-active: $sc-dim;
+    }
+    #tabs { height: 1; }
+    #barrow { height: 1; }
+    #prompt { width: 10; height: 1; }
+    #bar { width: 1fr; height: 1; border: none; padding: 0; background: $sc-bg; color: $sc-text; }
+    #bar:focus { border: none; background: $sc-bg; }
+    Input > .input--placeholder { color: $sc-faint; }
+    Input > .input--cursor { background: $sc-accent; color: $sc-bg; }
+    #list { height: 1fr; background: $sc-bg; border: round $sc-line; padding: 0 1;
+            border-title-color: $sc-dim; border-subtitle-color: $sc-faint; }
+    #list:focus { border: round $sc-accent; }
+    DataTable > .datatable--header { background: $sc-bg; color: $sc-faint; text-style: none; }
+    DataTable > .datatable--cursor { background: $sc-surface; color: $sc-accent2; text-style: bold; }
+    DataTable:focus > .datatable--cursor { background: $sc-surface; color: $sc-accent2; text-style: bold; }
+    DataTable > .datatable--hover { background: $sc-bg; }
+    #notice { height: 1; padding: 0 1; }
+    #np { height: auto; border: round $sc-line; border-title-color: $sc-dim; padding: 0 1; }
+    #title { height: 1; }
+    #spec { height: 5; }
+    #wave { height: 2; }
+    #time { height: 1; }
+    #keys { height: 2; padding: 0 1; }
+    """
+
+    BINDINGS = [
+        Binding("space", "pause", "Пауза", priority=True),
+        Binding("left", "seek(-5)", "−5с", priority=True),
+        Binding("right", "seek(5)", "+5с", priority=True),
+        Binding("n", "next", "След."),
+        Binding("b", "prev", "Пред."),
+        Binding("plus,equals", "volume(5)", "Громче"),
+        Binding("minus", "volume(-5)", "Тише"),
+        Binding("s", "shuffle", "Шаффл"),
+        Binding("r", "repeat", "Повтор"),
+        Binding("a", "enqueue", "В очередь"),
+        Binding("d", "dequeue", "Убрать"),
+        Binding("slash", "search", "Поиск"),
+        Binding("escape", "focus_list", "К списку"),
+        Binding("L", "login", "Вход"),
+        Binding("1", "view(0)", "Поиск"),
+        Binding("2", "view(1)", "Лайки"),
+        Binding("3", "view(2)", "Плейлисты"),
+        Binding("4", "view(3)", "Мои треки"),
+        Binding("5", "view(4)", "Очередь"),
+        Binding("t", "theme", "Тема"),
+        Binding("q", "quit_app", "Выход"),
+    ]
+
+    def __init__(self, initial: str | None = None):
+        super().__init__()
+        self.cfg = load_cfg()
+        self.initial = initial
+        self.mpv = None
+        self.mpv_proc = None
+        self.mpv_profile = None
+        self.mpv_error: str | None = None
+        self._mpv_starting = False
+        self._mpv_dead = False
+        self._mpv_retry_gen = -1
+        self._eof_detail = ""
+        self.analyzer: Analyzer | None = None
+        # воспроизведение
+        self.queue: list[dict] = []
+        self.idx = -1
+        self.current: dict | None = None
+        self.state = "idle"  # idle | loading | playing
+        self.gen = 0
+        self.duration = 0.0
+        self.paused = False
+        self.buffering = False
+        self.started = False
+        self._pos = 0.0
+        self._pos_t = time.monotonic()
+        self._eof: str | None = None
+        self._errors = 0
+        self.volume = int(self.cfg.get("volume", 70))
+        self.shuffle = bool(self.cfg.get("shuffle", False))
+        self.repeat = int(self.cfg.get("repeat", 0))
+        # визуализация
+        self.levels = np.zeros(8, np.float32)
+        self._frame = 0
+        # списки
+        self.view = "search"
+        self.lists: dict[str, list] = {
+            "search": [],
+            "likes": [],
+            "sets": [],
+            "mine": [],
+        }
+        self.loaded: dict[str, bool] = {}
+        self.input_mode = "search"
+        self._notice = ("", 0.0)
+        self.sc_theme = (
+            self.cfg.get("theme", "mocha")
+            if self.cfg.get("theme") in THEMES
+            else "mocha"
+        )
+
+    # ---------- сборка интерфейса
+    def get_css_variables(self) -> dict:
+        v = super().get_css_variables()
+        name = getattr(self, "sc_theme", None) or load_cfg().get("theme", "mocha")
+        v.update(
+            {f"sc-{k}": val for k, val in THEMES.get(name, THEMES["mocha"]).items()}
+        )
+        return v
+
+    @property
+    def pal(self) -> dict:
+        return THEMES.get(self.sc_theme, THEMES["mocha"])
+
+    def compose(self) -> ComposeResult:
+        yield Live(self.r_tabs, id="tabs")
+        with Horizontal(id="barrow"):
+            yield Live(self.r_prompt, id="prompt")
+            yield Input(
+                placeholder="найти музыку…   (Enter — искать · Esc — назад)", id="bar"
+            )
+        yield DataTable(id="list", cursor_type="row", zebra_stripes=False)
+        yield Live(self.r_notice, id="notice")
+        with Vertical(id="np"):
+            yield Live(self.r_title, id="title")
+            yield Live(self.r_spec, id="spec")
+            yield Live(self.r_wave, on_click=self.click_wave, id="wave")
+            yield Live(self.r_time, id="time")
+        yield KeyBar(self.r_keys, id="keys")
+
+    def on_mount(self) -> None:
+        self.query_one("#list", DataTable).focus()
+        self.query_one("#np").border_title = " сейчас играет "
+        self.refill()
+        self.set_interval(1 / 20, self.tick)
+        self._ui_ready = True
+        self.start_mpv()
+        if self.initial:
+            self.start_initial(self.initial)
+        else:
+            self.notice("Нажми /, чтобы найти музыку, или 2 — открыть свои лайки", 8)
+
+    # ---------- mpv
+    @work(thread=True)
+    def start_mpv(self) -> None:
+        self._mpv_starting = True
+        self.mpv_error = None
+        self._mpv_dead = False
+        try:
+            self.mpv, self.mpv_error = self._spawn_mpv()
+        finally:
+            self._mpv_starting = False
+        if self.mpv_error:
+            self.call_from_thread(self.notice, self.mpv_error, 10)
+
+    def _spawn_mpv(self):
+        """Пробует режимы запуска по очереди. Возвращает (MPV | None, ошибка | None)."""
+        exe = shutil.which("mpv") or "mpv"
+        nt = os.name == "nt"
+        sock = f"scplay-{os.getpid()}" if nt else f"/tmp/scplay-{os.getpid()}.sock"
+        try:
+            MPV_LOG.parent.mkdir(parents=True, exist_ok=True)
+            log = open(MPV_LOG, "wb")
+        except OSError:
+            log = subprocess.DEVNULL
+        extra_env = [
+            "--" + kv.strip().lstrip("-")
+            for kv in filter(None, os.environ.get("SCPLAY_MPV_OPTS", "").split(","))
+        ]
+        attempts = []
+        for name, extra in MPV_PROFILES:
+            if log is not subprocess.DEVNULL:
+                log.write(f"\n=== режим: {name} ===\n".encode())
+                log.flush()
+            m, err, fatal = self._launch(
+                exe, sock, MPV_BASE + extra + extra_env, log, name
+            )
+            if m:
+                self.mpv_profile = name
+                return m, None
+            attempts.append(err)
+            if fatal:
+                return None, err
+        try:
+            if log is not subprocess.DEVNULL:
+                log.write(("\n".join(attempts) + "\n").encode())
+                log.flush()
+        except Exception:
+            pass
+        sig = next(
+            (
+                w.strip("),:")
+                for a in attempts
+                for w in a.split()
+                if w.startswith("SIG")
+            ),
+            None,
+        )
+        if sig:
+            fix = (
+                "brew reinstall mpv" if sys.platform == "darwin" else "переустанови mpv"
+            )
+            if any(k.startswith("DYLD_") for k in os.environ):
+                fix = "в окружении есть DYLD_* (убери из ~/.zshrc) или " + fix
+            return (
+                None,
+                f"mpv падает ({sig}) в любом режиме — {fix}, затем: python scplay.py --diagnose",
+            )
+        return (
+            None,
+            "mpv не запускается: "
+            + clip(attempts[-1], 70)
+            + " · python scplay.py --diagnose",
+        )
+
+    def _launch(self, exe, sock, args, log, name):
+        """Один запуск mpv. Возвращает (MPV | None, ошибка | None, фатально ли)."""
+        nt = os.name == "nt"
+        endpoint = "\\\\.\\pipe\\" + sock if nt else sock
+        if not nt and os.path.exists(sock):
+            try:
+                os.remove(sock)
+            except OSError:
+                pass
+        cmd = [exe, *args, f"--volume={self.volume}", f"--input-ipc-server={sock}"]
+        try:
+            kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if nt else {}
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                env=clean_env(),
+                **kw,
+            )
+        except OSError as e:
+            return None, f"mpv не найден или не запускается: {e}", True
+        self.mpv_proc = proc
+        try:
+            from python_mpv_jsonipc import _ipc_endpoint_ready as ready_fn
+        except ImportError:
+            ready_fn = None
+        last_err = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 10:
+            rc = proc.poll()
+            if rc is not None:
+                return (
+                    None,
+                    f"[{name}] mpv завершился: {describe_exit(rc)} {self._mpv_log_tail(brief=True)}".strip(),
+                    False,
+                )
+            ready = (
+                ready_fn(endpoint)
+                if (nt and ready_fn)
+                else (os.path.exists(endpoint) or nt)
+            )
+            if ready:
+                try:
+                    m = MPV(
+                        start_mpv=False,
+                        ipc_socket=sock,
+                        quit_callback=self._on_mpv_quit,
+                    )
+                except Exception as e:
+                    last_err = e
+                else:
+                    m.bind_property_observer("time-pos", self._obs_pos)
+                    m.bind_property_observer("duration", self._obs_dur)
+                    m.bind_property_observer("pause", self._obs_pause)
+                    m.bind_property_observer("paused-for-cache", self._obs_buf)
+                    m.bind_event("end-file", self._on_end_file)
+                    return m, None, False
+            time.sleep(0.15)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return (
+            None,
+            f"[{name}] не удалось подключиться к IPC: {last_err or 'таймаут'}",
+            False,
+        )
+
+    @staticmethod
+    def _mpv_log_tail(brief: bool = False) -> str:
+        try:
+            text = MPV_LOG.read_text(errors="replace")
+            text = text.rsplit("=== режим", 1)[-1].split("===", 1)[-1]
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            return (
+                clip(lines[-1], 100) if lines else ("" if brief else f"см. {MPV_LOG}")
+            )
+        except OSError:
+            return ""
+
+    def _on_mpv_quit(self) -> None:
+        if not getattr(self, "_quitting", False):
+            self._mpv_dead = True
+
+    def stop_mpv(self) -> None:
+        self._quitting = True
+        try:
+            if self.mpv:
+                try:
+                    self.mpv.command("quit")
+                except Exception:
+                    pass
+                self.mpv.terminate()
+        except Exception:
+            pass
+        p = self.mpv_proc
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(1.5)
+            except Exception:
+                p.kill()
+
+    def _obs_pos(self, name, v):
+        if v is not None:
+            self._pos, self._pos_t, self.started = float(v), time.monotonic(), True
+
+    def _obs_dur(self, name, v):
+        if v:
+            self.duration = float(v)
+
+    def _obs_pause(self, name, v):
+        self._snap()
+        self.paused = bool(v)
+
+    def _obs_buf(self, name, v):
+        self.buffering = bool(v)
+
+    def _on_end_file(self, data):
+        reason = (data or {}).get("reason")
+        if reason in ("eof", "error"):
+            self._eof_detail = str((data or {}).get("file_error") or "")
+            self._eof = reason
+
+    def _snap(self) -> None:
+        self._pos, self._pos_t = self.position(), time.monotonic()
+
+    def position(self) -> float:
+        if self.state != "playing" or not self.started:
+            return self._pos if self.state == "playing" else 0.0
+        p = self._pos
+        if not self.paused and not self.buffering:
+            p += time.monotonic() - self._pos_t
+        return min(max(p, 0.0), self.duration) if self.duration else max(p, 0.0)
+
+    # ---------- уведомления
+    def notice(self, msg: str, secs: float = 5) -> None:
+        self._notice = (msg, time.monotonic() + secs)
+
+    # ---------- списки
+    def current_items(self) -> list[dict]:
+        return self.queue if self.view == "queue" else self.lists[self.view]
+
+    def refill(self, reset: bool = False) -> None:
+        t = self.query_one("#list", DataTable)
+        P = self.pal
+        keep = 0 if reset else t.cursor_row
+        w = max(self.size.width, 60)
+        num_w, time_w, who_w = 3, 7, max(14, min(24, w // 5))
+        title_w = max(16, w - num_w - time_w - who_w - 16)
+        t.clear(columns=True)
+        t.add_column(Text("#", style=P["faint"]), width=num_w)
+        t.add_column(Text("название", style=P["faint"]), width=title_w)
+        t.add_column(Text("автор", style=P["faint"]), width=who_w)
+        t.add_column(Text("время", style=P["faint"], justify="right"), width=time_w)
+        items = self.current_items()
+        cur_url = self.current["url"] if self.current else None
+        for i, tr in enumerate(items):
+            playing = cur_url is not None and tr["url"] == cur_url
+            mark = (
+                Text("▶", style=P["ok"])
+                if playing
+                else Text(str(i + 1), style=P["faint"])
+            )
+            title = ("≡ " if tr.get("kind") == "playlist" else "") + tr["title"]
+            t.add_row(
+                mark,
+                Text(clip(title, title_w), style=P["ok"] if playing else P["text"]),
+                Text(clip(tr["uploader"], who_w), style=P["dim"]),
+                Text(
+                    fmt(tr["duration"]) if tr.get("duration") else "",
+                    style=P["faint"],
+                    justify="right",
+                ),
+                key=str(i),
+            )
+        t.border_title = f" {TAB_NAMES[VIEWS.index(self.view)].lower()} "
+        t.border_subtitle = f" {len(items)} " if items else ""
+        if items:
+            t.move_cursor(row=min(keep, len(items) - 1))
+
+    def highlighted(self) -> dict | None:
+        items = self.current_items()
+        row = self.query_one("#list", DataTable).cursor_row
+        return items[row] if 0 <= row < len(items) else None
+
+    def set_list(self, name: str, items: list[dict], flag: bool = True) -> None:
+        self.lists[name] = items
+        self.loaded[name] = flag
+        if self.view == name:
+            self.refill(reset=True)
+            if not items:
+                self.notice("Ничего не найдено")
+            else:
+                self.notice(f"Найдено: {len(items)}. Enter — играть, a — в очередь", 6)
+
+    def on_resize(self, event: events.Resize) -> None:
+        if getattr(self, "_ui_ready", False):
+            self.refill()
+
+    # ---------- действия: вкладки / поиск / вход
+    def action_view(self, i: int) -> None:
+        name = VIEWS[i]
+        again = name == self.view
+        self.view = name
+        self.refill(reset=True)
+        self.query_one("#list", DataTable).focus()
+        if name in ("likes", "sets", "mine"):
+            if not self.cfg.get("profile"):
+                self.notice("Для этой вкладки нужен вход — нажми L", 6)
+            elif again or not self.loaded.get(name):
+                self.load_view(name)
+        elif name == "queue" and not self.queue:
+            self.notice("Очередь пуста. Нажми a на треке, чтобы добавить", 5)
+        elif name == "search" and not self.lists["search"]:
+            self.notice("Нажми /, чтобы найти музыку", 5)
+
+    @work(thread=True)
+    def load_view(self, name: str) -> None:
+        suffix = {"likes": "/likes", "sets": "/sets", "mine": "/tracks"}[name]
+        self.call_from_thread(self.notice, "Загружаю…", 30)
+        try:
+            items = profile_list(self.cfg, name, 100)
+        except Exception:
+            try:  # запасной путь: без автора и длительности
+                items = extract_list(
+                    self.cfg["profile"].rstrip("/") + suffix, self.cfg, 100
+                )
+            except Exception as e:
+                self.call_from_thread(
+                    self.notice, f"Ошибка загрузки: {clip(str(e), 80)}", 8
+                )
+                return
+        self.call_from_thread(self.set_list, name, items)
+
+    def action_search(self) -> None:
+        self.input_mode = "search"
+        bar = self.query_one("#bar", Input)
+        bar.placeholder = "найти музыку…   (Enter — искать · Esc — назад)"
+        bar.value = ""
+        bar.focus()
+
+    def action_login(self) -> None:
+        self.input_mode = "login"
+        bar = self.query_one("#bar", Input)
+        bar.placeholder = "браузер: firefox, chrome, edge, brave…  |  file путь/cookies.txt  |  logout"
+        bar.value = ""
+        bar.focus()
+
+    def action_theme(self) -> None:
+        names = list(THEMES)
+        self.sc_theme = names[(names.index(self.sc_theme) + 1) % len(names)]
+        self.cfg["theme"] = self.sc_theme
+        save_cfg(self.cfg)
+        self.refresh_css(animate=False)
+        self.refill()
+        self.notice(f"Тема: {self.sc_theme}", 3)
+
+    def action_focus_list(self) -> None:
+        self.query_one("#list", DataTable).focus()
+
+    def on_input_submitted(self, ev: Input.Submitted) -> None:
+        text = ev.value.strip()
+        mode, self.input_mode = self.input_mode, "search"
+        ev.input.value = ""
+        self.query_one("#list", DataTable).focus()
+        if not text:
+            return
+        if mode == "login":
+            self.do_login(text)
+        elif text.startswith("http") or os.path.exists(text):
+            self.start_initial(text)
+        else:
+            self.view = "search"
+            self.notice(f"Ищу «{text}»…", 30)
+            self.do_search(text)
+
+    @work(thread=True)
+    def do_search(self, q: str) -> None:
+        try:
+            items = extract_list(f"scsearch25:{q}", self.cfg, 25)
+        except Exception as e:
+            self.call_from_thread(self.notice, f"Ошибка поиска: {clip(str(e), 80)}", 8)
+            return
+        self.call_from_thread(self.set_list, "search", items)
+
+    @work(thread=True)
+    def do_login(self, text: str) -> None:
+        if text.lower() == "logout":
+            self.cfg.pop("browser", None)
+            self.cfg.pop("cookiefile", None)
+            self.cfg.pop("profile", None)
+            self.cfg.pop("username", None)
+            save_cfg(self.cfg)
+            self.loaded.clear()
+            self.call_from_thread(self.notice, "Вышел из аккаунта", 5)
+            return
+        parts = text.split(maxsplit=1)
+        auth = (
+            {"cookiefile": parts[1].strip('"')}
+            if parts[0] == "file" and len(parts) > 1
+            else {"cookiesfrombrowser": (parts[0].lower(),)}
+        )
+        self.call_from_thread(self.notice, "Проверяю вход…", 30)
+        token, err = get_token(auth)
+        if not token:
+            msg = (
+                ("Не получилось прочитать cookie: " + clip(err, 70))
+                if err
+                else "Вход не найден: залогинься на soundcloud.com в этом браузере и повтори"
+            )
+            self.call_from_thread(self.notice, msg, 10)
+            return
+        self.cfg.pop("browser", None)
+        self.cfg.pop("cookiefile", None)
+        if "cookiefile" in auth:
+            self.cfg["cookiefile"] = auth["cookiefile"]
+        else:
+            self.cfg["browser"] = auth["cookiesfrombrowser"][0]
+        me = fetch_me(token)
+        if me and me.get("permalink_url"):
+            self.cfg["profile"] = me["permalink_url"]
+            self.cfg["username"] = me.get("username")
+        else:
+            self.cfg.pop("profile", None)
+        save_cfg(self.cfg)
+        self.loaded.clear()
+        if self.cfg.get("profile"):
+            self.call_from_thread(
+                self.notice, f"Вошёл как {self.cfg.get('username')}. Нажми 2 — лайки", 8
+            )
+        else:
+            self.call_from_thread(
+                self.notice,
+                "Cookie найдены, но профиль определить не удалось "
+                "(плейлисты и лайки недоступны)",
+                10,
+            )
+
+    # ---------- запуск воспроизведения
+    def start_initial(self, arg: str) -> None:
+        if os.path.exists(arg):
+            tr = {
+                "title": Path(arg).name,
+                "uploader": "локальный файл",
+                "duration": None,
+                "url": str(Path(arg).resolve()),
+                "kind": "track",
+            }
+            self.queue, self.idx = [tr], 0
+            self.play_index(0)
+        elif arg.startswith("http"):
+            self.notice("Открываю ссылку…", 30)
+            self.open_url(arg)
+        else:
+            self.view = "search"
+            self.notice(f"Ищу «{arg}»…", 30)
+            self.do_search(arg)
+
+    @work(thread=True)
+    def open_url(self, url: str) -> None:
+        try:
+            items = get_tracks(self.cfg, url)
+        except Exception as e:
+            self.call_from_thread(
+                self.notice, f"Не удалось открыть: {clip(str(e), 80)}", 8
+            )
+            return
+        self.call_from_thread(self.play_list, items)
+
+    def play_list(self, items: list[dict], start: int = 0) -> None:
+        tracks = [t for t in items if t.get("kind") != "playlist"]
+        if not tracks:
+            self.notice("В плейлисте нет треков")
+            return
+        self.queue = tracks
+        self.play_index(start)
+
+    def on_data_table_row_selected(self, ev: DataTable.RowSelected) -> None:
+        i = int(ev.row_key.value)
+        items = self.current_items()
+        if not (0 <= i < len(items)):
+            return
+        tr = items[i]
+        if self.view == "queue":
+            self.play_index(i)
+        elif tr.get("kind") == "playlist":
+            self.notice(f"Открываю плейлист «{clip(tr['title'], 40)}»…", 30)
+            self.open_url(tr["url"])
+        else:
+            tracks = [t for t in items if t.get("kind") != "playlist"]
+            start = next(k for k, t in enumerate(tracks) if t is tr)
+            self.play_list(items, start)
+
+    def play_index(self, i: int) -> None:
+        if not (0 <= i < len(self.queue)):
+            return
+        self.idx = i
+        track = self.queue[i]
+        self.gen += 1
+        self.current = track
+        self.state = "loading"
+        self.started = False
+        self._pos, self._pos_t = 0.0, time.monotonic()
+        self.duration = float(track.get("duration") or 0)
+        self.paused = False
+        if self.analyzer:
+            self.analyzer.stop()
+            self.analyzer = None
+        self.refill()
+        self.resolve_worker(self.gen, track)
+
+    @work(thread=True)
+    def resolve_worker(self, gen: int, track: dict) -> None:
+        try:
+            info = resolve_stream(track, self.cfg)
+        except Exception as e:
+            self.call_from_thread(self.on_load_error, gen, e)
+            return
+        self.call_from_thread(self.on_resolved, gen, track, info)
+
+    def on_load_error(self, gen: int, err: Exception) -> None:
+        if gen != self.gen:
+            return
+        self._errors += 1
+        self.notice(
+            f"Не удалось загрузить «{clip(self.current['title'], 30)}»: {clip(str(err), 60)}",
+            8,
+        )
+        if self._errors < 3:
+            self.advance(+1, auto=True)
+        else:
+            self.stop_playback()
+
+    def on_resolved(self, gen: int, track: dict, info: dict) -> None:
+        if gen != self.gen:
+            return
+        if self.mpv is None:
+            if self._mpv_starting:  # mpv ещё стартует — ждём
+                self.set_timer(0.3, lambda: self.on_resolved(gen, track, info))
+                return
+            if self._mpv_retry_gen != gen:  # не запустился — одна попытка перезапуска
+                self._mpv_retry_gen = gen
+                self.start_mpv()
+                self.set_timer(0.5, lambda: self.on_resolved(gen, track, info))
+                return
+            self.notice(self.mpv_error or "mpv недоступен", 10)
+            self.stop_playback()
+            return
+        self._errors = 0
+        self.duration = float(info.get("duration") or track.get("duration") or 0)
+        try:
+            self.mpv.command("loadfile", info["url"], "replace")
+            self.mpv.pause = False
+        except Exception as e:
+            self.notice(f"Ошибка mpv: {clip(str(e), 70)}", 8)
+            return
+        self._pos, self._pos_t, self.started = 0.0, time.monotonic(), False
+        self.analyzer = Analyzer(info["url"], self.duration)
+        self.state = "playing"
+        self.refill()
+
+    def stop_playback(self) -> None:
+        self.gen += 1
+        self.state = "idle"
+        self.current = None
+        self._pos = 0.0
+        if self.analyzer:
+            self.analyzer.stop()
+            self.analyzer = None
+        try:
+            if self.mpv:
+                self.mpv.command("stop")
+        except Exception:
+            pass
+        self.refill()
+
+    def advance(self, step: int, auto: bool = False) -> None:
+        n = len(self.queue)
+        if not n:
+            return
+        if auto and self.repeat == 2:
+            return self.play_index(self.idx)
+        if step < 0:
+            if self.position() > 3 and not auto:
+                return self.seek_to(0)
+            nxt = self.idx - 1
+            if nxt < 0:
+                nxt = n - 1 if self.repeat == 1 else 0
+            return self.play_index(nxt)
+        if self.shuffle and n > 1:
+            return self.play_index(
+                random.choice([i for i in range(n) if i != self.idx])
+            )
+        nxt = self.idx + 1
+        if nxt >= n:
+            if self.repeat == 1:
+                nxt = 0
+            else:
+                self.notice("Конец очереди")
+                return self.stop_playback()
+        self.play_index(nxt)
+
+    # ---------- управление
+    def action_pause(self) -> None:
+        if self.state != "playing" or not self.mpv:
+            return
+        self._snap()
+        self.paused = not self.paused
+        try:
+            self.mpv.pause = self.paused
+        except Exception:
+            pass
+
+    def seek_to(self, t: float) -> None:
+        if self.state != "playing" or not self.mpv:
+            return
+        if self.duration:
+            t = min(t, max(self.duration - 0.5, 0))
+        t = max(t, 0.0)
+        try:
+            self.mpv.command("seek", t, "absolute")
+        except Exception:
+            return
+        self._pos, self._pos_t = t, time.monotonic()
+
+    def action_seek(self, delta: int) -> None:
+        self.seek_to(self.position() + delta)
+
+    def click_wave(self, x: int, width: int) -> None:
+        if self.duration and width > 1:
+            self.seek_to(self.duration * x / (width - 1))
+
+    def action_next(self) -> None:
+        self.advance(+1)
+
+    def action_prev(self) -> None:
+        self.advance(-1)
+
+    def action_volume(self, delta: int) -> None:
+        self.volume = max(0, min(130, self.volume + delta))
+        try:
+            if self.mpv:
+                self.mpv.volume = self.volume
+        except Exception:
+            pass
+
+    def action_shuffle(self) -> None:
+        self.shuffle = not self.shuffle
+        self.notice("Шаффл: " + ("вкл" if self.shuffle else "выкл"), 3)
+
+    def action_repeat(self) -> None:
+        self.repeat = (self.repeat + 1) % 3
+        self.notice("Повтор: " + REPEAT_NAMES[self.repeat], 3)
+
+    def action_enqueue(self) -> None:
+        tr = self.highlighted()
+        if not tr or self.view == "queue":
+            return
+        if tr.get("kind") == "playlist":
+            self.notice("Добавляю плейлист…", 20)
+            self.enqueue_playlist(tr["url"])
+            return
+        self.queue.append(tr)
+        self.notice(
+            f"В очереди: {len(self.queue)}  (добавлено «{clip(tr['title'], 40)}»)", 4
+        )
+        if self.state == "idle":
+            self.play_index(len(self.queue) - 1)
+
+    @work(thread=True)
+    def enqueue_playlist(self, url: str) -> None:
+        try:
+            items = [
+                t for t in get_tracks(self.cfg, url) if t.get("kind") != "playlist"
+            ]
+        except Exception as e:
+            self.call_from_thread(self.notice, f"Ошибка: {clip(str(e), 80)}", 8)
+            return
+        self.call_from_thread(self._extend_queue, items)
+
+    def _extend_queue(self, items: list[dict]) -> None:
+        first = len(self.queue)
+        self.queue.extend(items)
+        self.notice(f"Добавлено треков: {len(items)}. В очереди: {len(self.queue)}", 4)
+        if self.state == "idle" and items:
+            self.play_index(first)
+
+    def action_dequeue(self) -> None:
+        if self.view != "queue" or not self.queue:
+            return
+        row = self.query_one("#list", DataTable).cursor_row
+        if not (0 <= row < len(self.queue)):
+            return
+        del self.queue[row]
+        if row < self.idx:
+            self.idx -= 1
+        elif row == self.idx:
+            self.idx -= 1  # текущий доиграет, дальше — следующий
+        self.refill()
+
+    async def action_quit_app(self) -> None:
+        self.cfg.update(volume=self.volume, shuffle=self.shuffle, repeat=self.repeat)
+        save_cfg(self.cfg)
+        if self.analyzer:
+            self.analyzer.stop()
+        self.stop_mpv()
+        self.exit()
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        # когда курсор в строке ввода, горячие клавиши не перехватываем
+        if isinstance(self.focused, Input) and action in ("pause", "seek"):
+            return False
+        return True
+
+    # ---------- такт: визуализация и события
+    def tick(self) -> None:
+        self._frame += 1
+        if self._mpv_dead:
+            self._mpv_dead = False
+            self.mpv = None
+            rc = None
+            if self.mpv_proc:
+                try:
+                    rc = self.mpv_proc.wait(0.5)
+                except Exception:
+                    rc = self.mpv_proc.poll()
+            why = f" ({describe_exit(rc)})" if rc not in (None, 0) else ""
+            self.mpv_error = (
+                f"mpv завершился{why} — Enter на треке перезапустит; "
+                "если повторяется: python scplay.py --diagnose"
+            )
+            self.stop_playback()
+        if self._eof:
+            reason, self._eof = self._eof, None
+            if self.state == "playing":
+                if reason == "error":
+                    self.notice(
+                        "Ошибка воспроизведения"
+                        + (f" ({self._eof_detail})" if self._eof_detail else "")
+                        + ", пробую следующий трек",
+                        6,
+                    )
+                self.advance(+1, auto=True)
+        spec = self.query_one("#spec")
+        nb = self.bars_for(spec.size.width)
+        new = None
+        if (
+            self.state == "playing"
+            and self.analyzer
+            and not self.paused
+            and self.started
+        ):
+            new = self.analyzer.spectrum(self.position(), nb)
+        if len(self.levels) != nb:
+            self.levels = np.zeros(nb, np.float32)
+        if new is None:
+            self.levels = np.maximum(self.levels - 0.06, 0)
+        else:
+            self.levels = np.where(
+                new > self.levels,
+                self.levels + (new - self.levels) * 0.55,
+                np.maximum(self.levels - 0.045, new),
+            )
+        spec.refresh()
+        self.query_one("#time").refresh()
+        self.query_one("#title").refresh()
+        self.query_one("#notice").refresh()
+        if self._frame % 2 == 0:
+            self.query_one("#wave").refresh()
+        if self._frame % 5 == 0:
+            self.query_one("#tabs").refresh()
+            self.query_one("#prompt").refresh()
+
+    @staticmethod
+    def bars_for(width: int) -> int:
+        return max(12, min(56, (width + 1) // 2))
+
+    # ---------- отрисовка
+    def r_prompt(self, w: int, h: int) -> Text:
+        label = "вход" if self.input_mode == "login" else "поиск"
+        P = self.pal
+        focused = isinstance(self.focused, Input)
+        t = Text(no_wrap=True, overflow="crop")
+        t.append(" " + label.ljust(6), style=P["dim"] if not focused else P["text"])
+        t.append(" ❯ ", style=P["accent"] if focused else P["faint"])
+        return t
+
+    def r_tabs(self, w: int, h: int) -> Text:
+        P = self.pal
+        t = Text(" ", no_wrap=True, overflow="crop")
+        for i, (v, name) in enumerate(zip(VIEWS, TAB_NAMES)):
+            extra = f" {len(self.queue)}" if v == "queue" and self.queue else ""
+            t.append(f"{i + 1} ", style=P["faint"])
+            if v == self.view:
+                t.append(name.lower() + extra, style=f"bold underline {P['accent']}")
+            else:
+                t.append(name.lower() + extra, style=P["dim"])
+            t.append("   ")
+        who = self.cfg.get("username") or (
+            "вошёл" if self.cfg.get("profile") else "гость · L вход"
+        )
+        gap = w - t.cell_len - len(who) - 1
+        if gap > 0:
+            t.append(" " * gap)
+            t.append(who, style=P["faint"])
+        return t
+
+    def r_notice(self, w: int, h: int) -> Text:
+        P = self.pal
+        msg, until = self._notice
+        if msg and time.monotonic() < until:
+            return Text(clip(msg, w), style=P["accent"], no_wrap=True, overflow="crop")
+        if self.mpv_error and self.mpv is None and not self._mpv_starting:
+            return Text(
+                clip("⚠ " + self.mpv_error, w),
+                style=P["err"],
+                no_wrap=True,
+                overflow="crop",
+            )
+        hint = "Enter — играть  ·  / — искать  ·  1–5 — вкладки  ·  t — тема"
+        return Text(clip(hint, w), style=P["faint"], no_wrap=True, overflow="crop")
+
+    def r_title(self, w: int, h: int) -> Text:
+        P = self.pal
+        if self.state == "idle" or not self.current:
+            return Text(
+                "■ ничего не играет", style=P["faint"], no_wrap=True, overflow="crop"
+            )
+        icon = "…" if self.state == "loading" else ("‖" if self.paused else "▶")
+        tr = self.current
+        right = f"{self.idx + 1}/{len(self.queue)}"
+        room = max(w - len(right) - 3, 10)
+        title = clip(tr["title"], room)
+        who = (
+            clip(tr.get("uploader") or "", max(room - len(title) - 3, 0))
+            if tr.get("uploader")
+            else ""
+        )
+        t = Text(no_wrap=True, overflow="crop")
+        t.append(icon + " ", style=P["ok"] if not self.paused else P["faint"])
+        t.append(title, style=f"bold {P['text']}")
+        used = 2 + len(title)
+        if who:
+            t.append("  " + who, style=P["dim"])
+            used += 2 + len(who)
+        t.append(" " * max(w - used - len(right), 1))
+        t.append(right, style=P["faint"])
+        return t
+
+    def r_spec(self, w: int, h: int) -> Text:
+        P = self.pal
+        if self.state != "playing" or not self.analyzer:
+            msg = (
+                "загрузка…" if self.state == "loading" else "выбери трек и нажми Enter"
+            )
+            lines = [Text("") for _ in range(h)]
+            lines[h // 2] = Text(msg.center(w), style=P["line"])
+            return Text("\n").join(lines)
+        nb = len(self.levels)
+        pad = max((w - (nb * 2 - 1)) // 2, 0)
+        lines = []
+        for r in range(h):
+            rb = h - 1 - r
+            color = lerp_hex(P["accent"], P["accent2"], rb / max(h - 1, 1))
+            t = Text(" " * pad, no_wrap=True, overflow="crop")
+            for i in range(nb):
+                fill = int(
+                    min(8, max(0, round(float(self.levels[i]) * h * 8) - rb * 8))
+                )
+                t.append(BLOCKS[fill] + (" " if i < nb - 1 else ""), style=color)
+            lines.append(t)
+        return Text("\n").join(lines)
+
+    def r_wave(self, w: int, h: int) -> Text:
+        P = self.pal
+        if self.state == "idle" or not self.analyzer:
+            lines = [Text("") for _ in range(h)]
+            lines[h - 1] = Text("▁" * w, style=P["line"])
+            return Text("\n").join(lines)
+        peaks = self.analyzer.wave(w, self.duration)
+        total = self.duration or 1.0
+        played = int(w * min(self.position() / total, 1.0))
+        lines = []
+        for r in range(h):
+            rb = h - 1 - r
+            t = Text(no_wrap=True, overflow="crop")
+            for c in range(w):
+                p = max(float(peaks[c]), 0.07)
+                fill = int(min(8, max(0, round(p * h * 8) - rb * 8)))
+                if c == played:
+                    style = P["text"]
+                elif c < played:
+                    style = P["accent"]
+                else:
+                    style = P["line"]
+                t.append(BLOCKS[fill], style=style)
+            lines.append(t)
+        return Text("\n").join(lines)
+
+    def r_time(self, w: int, h: int) -> Text:
+        P = self.pal
+        pos = self.position() if self.state == "playing" else 0
+        left = fmt(pos)
+        right = fmt(self.duration) if self.duration else "--:--"
+        mid = (
+            f"громкость {self.volume}%  ·  шаффл {'вкл' if self.shuffle else 'выкл'}  ·  "
+            f"повтор {REPEAT_NAMES[self.repeat]}"
+        )
+        if self.buffering and self.state == "playing":
+            mid = "буферизация…  ·  " + mid
+        room = max(w - len(left) - len(right) - 2, 0)
+        t = Text(no_wrap=True, overflow="crop")
+        t.append(left, style=P["text"])
+        t.append(" " + clip(mid, room).center(room) + " ", style=P["faint"])
+        t.append(right, style=P["dim"])
+        return t
+
+    @staticmethod
+    def layout_keys(width: int):
+        lines, cur, curw = [], [], 0
+        for k, label in KEYS:
+            wd = len(k) + 1 + len(label)
+            add = wd + (3 if cur else 0)
+            if cur and curw + add > width:
+                lines.append(cur)
+                cur, curw, add = [], 0, wd
+            cur.append((k, label))
+            curw += add
+        if cur:
+            lines.append(cur)
+        return lines
+
+    def r_keys(self, w: int, h: int) -> Text:
+        P = self.pal
+        out = []
+        for line in self.layout_keys(max(w, 20)):
+            t = Text(no_wrap=True, overflow="crop")
+            for j, (k, label) in enumerate(line):
+                if j:
+                    t.append(" │ ", style=P["line"])
+                t.append(k, style=P["accent2"])
+                t.append(" " + label, style=P["faint"])
+            out.append(t)
+        return Text("\n").join(out)
+
+
+def main() -> None:
+    if sys.argv[1:] == ["--diagnose"]:
+        return diagnose()
+    initial = " ".join(sys.argv[1:]).strip() or None
+    app = ScPlay(initial)
+    atexit.register(app.stop_mpv)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()

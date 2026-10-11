@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Секреты и локальные данные — никогда не коммитить
+cookies*.txt
+*cookies*.txt
+config.json
+*.log
+login
+
+# Система / редакторы
+.DS_Store
+.idea/
+.vscode/
