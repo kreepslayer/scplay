@@ -45,13 +45,13 @@ SoundCloud прямо в терминале: поиск, лайки, плейл�
 Прямо из GitHub:
 
 ```
-pipx install git+https://github.com/YOUR_USERNAME/scplay.git
+pipx install git+https://github.com/kreepslayer/scplay.git
 ```
 
 Или из клонированной папки (удобно для разработки: изменения в `scplay.py` применяются сразу):
 
 ```
-git clone https://github.com/YOUR_USERNAME/scplay.git
+git clone https://github.com/kreepslayer/scplay.git
 cd scplay
 pipx install --editable .
 ```
