@@ -30,15 +30,35 @@ SoundCloud прямо в терминале: поиск, лайки, плейл�
 
 **1. Поставь mpv, ffmpeg и pipx**
 
-| Система          | Команда                                                                                                      |
-| ---------------- | ------------------------------------------------------------------------------------------------------------ |
-| macOS (Homebrew) | `brew install mpv ffmpeg pipx`                                                                               |
-| Debian / Ubuntu  | `sudo apt install mpv ffmpeg pipx`                                                                           |
-| Arch             | `sudo pacman -S mpv ffmpeg python-pipx`                                                                      |
-| Fedora           | `sudo dnf install mpv ffmpeg pipx` (ffmpeg может потребовать RPM Fusion)                                     |
-| Windows (winget) | `winget install --id shinchiro.mpv -e` и `winget install Gyan.FFmpeg`, затем `py -m pip install --user pipx` |
+macOS и Linux:
+
+| Система          | Команда                                                                  |
+| ---------------- | ------------------------------------------------------------------------ |
+| macOS (Homebrew) | `brew install mpv ffmpeg pipx`                                           |
+| Debian / Ubuntu  | `sudo apt install mpv ffmpeg pipx`                                       |
+| Arch             | `sudo pacman -S mpv ffmpeg python-pipx`                                  |
+| Fedora           | `sudo dnf install mpv ffmpeg pipx` (ffmpeg может потребовать RPM Fusion) |
 
 После установки pipx выполни `pipx ensurepath` и открой новое окно терминала.
+
+Windows — через [Scoop](https://scoop.sh), всё делается в PowerShell:
+
+```powershell
+# 1. Сам Scoop (если ещё не стоит)
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+irm get.scoop.sh | iex
+
+# 2. mpv лежит в bucket «extras»
+scoop bucket add extras
+
+# 3. Всё нужное одной командой (git нужен для установки из GitHub)
+scoop install git python pipx mpv ffmpeg
+
+# 4. Добавить pipx в PATH, затем открыть новое окно терминала
+pipx ensurepath
+```
+
+Если `pipx` из Scoop по какой-то причине недоступен: `python -m pip install --user pipx`, затем `python -m pipx ensurepath`.
 
 **2. Поставь scplay**
 
@@ -107,11 +127,11 @@ scplay song.mp3         # играть локальный файл
 
 ## Поддерживаемые платформы
 
-| Платформа             | Статус                                                                                                                                                                                                     |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS (Apple Silicon) | ✅ основная платформа, работает                                                                                                                                                                            |
-| Linux                 | 🟡 ожидаемо работает: интерфейс, управление и воспроизведение проверены на Ubuntu. Для входа из Chrome/Chromium может понадобиться `pip install secretstorage`; проще использовать Firefox                 |
-| Windows               | ⚠️ экспериментально, не проверялось. Нужен современный терминал (Windows Terminal). Вход через cookie Chrome/Edge может не работать из-за их шифрования, в этом случае используй Firefox или `cookies.txt` |
+| Платформа             | Статус                                                                                                                                                                                                                        |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS (Apple Silicon) | ✅ основная платформа, работает                                                                                                                                                                                               |
+| Linux                 | 🟡 ожидаемо работает: интерфейс, управление и воспроизведение проверены на Ubuntu. Для входа из Chrome/Chromium может понадобиться `pip install secretstorage`; проще использовать Firefox                                    |
+| Windows               | ✅ работает (проверено; установка через Scoop). Лучше использовать Windows Terminal. Если вход через cookie Chrome/Edge не сработал (у этих браузеров свои ограничения на чтение cookie), используй Firefox или `cookies.txt` |
 
 Если нашёл проблему на своей системе, открой issue и приложи вывод `scplay --diagnose`.
 
@@ -120,6 +140,8 @@ scplay song.mp3         # играть локальный файл
 **`scplay --diagnose`** проверяет mpv и ffmpeg, окружение и по шагам прогоняет запуск, подключение и воспроизведение (звук при этом выключен). Первым делом запусти его.
 
 **mpv падает с `bus error` / SIGBUS на macOS.** Это сбой самого mpv, а не программы. Проверь, что `mpv --version` работает в обычном терминале. Одна из известных причин — переменная окружения `DYLD_LIBRARY_PATH` в `~/.zshrc`; `scplay` очищает `DYLD_*` для своих дочерних процессов, но лучше убрать её совсем. Если падает даже `env -i HOME="$HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin mpv --version`, помогает `brew reinstall mpv`.
+
+**`mpv` / `ffmpeg` не найден после `scoop install` (Windows).** Открой новое окно PowerShell: PATH обновляется только в новых окнах. Проверь `mpv --version` и `ffmpeg -version`. Если mpv не находится, убедись, что добавлен bucket `extras` (`scoop bucket add extras`).
 
 **Трек висит на «загрузка…».** Посмотри красное сообщение внизу и файл `~/.config/scplay/mpv.log`. Если ошибка от yt-dlp, обнови его: `pipx upgrade scplay` или `pipx inject scplay yt-dlp --force`. Он часто обновляется под изменения SoundCloud.
 
