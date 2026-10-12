@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scplay"
+version = "0.2.0"
+description = "SoundCloud в терминале: поиск, лайки, плейлисты, визуализатор и волна"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["soundcloud", "tui", "terminal", "music", "mpv", "textual"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+dependencies = [
+    "yt-dlp",
+    "textual>=1.0",
+    "numpy",
+    "python-mpv-jsonipc>=1.2",
+]
+
+[project.scripts]
+scplay = "scplay:main"
+
+[tool.setuptools]
+py-modules = ["scplay"]

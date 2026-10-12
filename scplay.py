@@ -118,6 +118,12 @@ VIEWS = ["search", "likes", "sets", "mine", "queue"]
 TAB_NAMES = ["Поиск", "Лайки", "Плейлисты", "Мои треки", "Очередь"]
 REPEAT_NAMES = ["выкл", "все", "один"]
 
+CACHE_TTL = 20 * 60  # сколько секунд ссылка на поток считается свежей
+CACHE_MAX = 12  # максимум ссылок в кэше
+PREFETCH_LEAD = (
+    300  # готовим следующий трек, когда до конца текущего осталось не больше (сек)
+)
+
 # Режимы запуска mpv: по очереди, пока один не заработает.
 MPV_BASE = [
     "--idle=yes",
@@ -334,10 +340,49 @@ def get_tracks(cfg: dict, url: str, n: int = 200) -> list[dict]:
     return extract_list(url, cfg, n)
 
 
+def fast_resolve(track: dict, cfg: dict) -> dict:
+    """Ссылка на поток за 2 запроса: yt-dlp опрашивает все форматы по очереди (4-6 запросов),
+    а нужен только один. Любая ошибка -> вызывающий код откатится на обычный yt-dlp."""
+    with yt_dlp.YoutubeDL(ydl_base(cfg)) as ydl:
+        ie = _sc_ie(ydl, "Soundcloud")
+        info = ie._download_json(
+            ie._resolv_url(track["url"]), "track", headers=ie._HEADERS
+        )
+        best = None
+        for t in (info.get("media") or {}).get("transcodings") or []:
+            u = t.get("url")
+            if not u or t.get("snipped") or "/preview/" in u:
+                continue  # пропускаем 30-секундные превью
+            progressive = (t.get("format") or {}).get(
+                "protocol"
+            ) == "progressive" and "/hls" not in u
+            preset = str(t.get("preset") or "")
+            codec = (
+                2 if preset.startswith("aac") else 1 if preset.startswith("mp3") else 0
+            )
+            rank = (t.get("quality") == "hq", progressive, codec)
+            if best is None or rank > best[0]:
+                best = (rank, u)
+        if best is None:
+            raise RuntimeError("нет подходящего формата")
+        stream = ie._download_json(
+            best[1], "stream", query={"client_id": ie._CLIENT_ID}, headers=ie._HEADERS
+        )
+    url = (stream or {}).get("url")
+    if not url:
+        raise RuntimeError("пустая ссылка на поток")
+    dur = info.get("full_duration") or info.get("duration")
+    return {"url": url, "duration": (dur / 1000.0) if dur else track.get("duration")}
+
+
 def resolve_stream(track: dict, cfg: dict) -> dict:
     """Возвращает {'url': прямая ссылка на аудио, 'duration': сек}."""
     if os.path.exists(track["url"]):
         return {"url": track["url"], "duration": track.get("duration")}
+    try:
+        return fast_resolve(track, cfg)
+    except Exception:
+        pass  # запасной путь: полный yt-dlp
     with yt_dlp.YoutubeDL(ydl_base(cfg, format="bestaudio/best")) as ydl:
         info = ydl.extract_info(track["url"], download=False)
     if info.get("entries"):
@@ -887,6 +932,17 @@ class ScPlay(App):
         self._mpv_dead = False
         self._mpv_retry_gen = -1
         self._eof_detail = ""
+        # подготовка следующего трека
+        self.cache: dict[str, tuple[float, dict]] = {}
+        self.next_idx: int | None = (
+            None  # выбранный заранее следующий (важно для шаффла)
+        )
+        self.next_analyzer: tuple[str, Analyzer] | None = None
+        self.mpv_next_url: str | None = None  # что уже добавлено в плейлист mpv
+        self._pf_key = None
+        self._cached_play = False
+        self._retry_url: str | None = None
+        self._handoff_ok = False
         self.analyzer: Analyzer | None = None
         # воспроизведение
         self.queue: list[dict] = []
@@ -1096,6 +1152,11 @@ class ScPlay(App):
                     m.bind_property_observer("pause", self._obs_pause)
                     m.bind_property_observer("paused-for-cache", self._obs_buf)
                     m.bind_event("end-file", self._on_end_file)
+                    for opt in ("prefetch-playlist", "gapless-audio"):
+                        try:
+                            m.command("set_property", opt, "yes")
+                        except Exception:
+                            pass
                     return m, None, False
             time.sleep(0.15)
         try:
@@ -1449,8 +1510,14 @@ class ScPlay(App):
         if self.analyzer:
             self.analyzer.stop()
             self.analyzer = None
+        self.next_idx = None
+        self._pf_key = None
         self.refill()
-        self.resolve_worker(self.gen, track)
+        info = self.cache_get(track)
+        if info:  # ссылка уже готова — стартуем сразу
+            self.on_resolved(self.gen, track, info, cached=True)
+        else:
+            self.resolve_worker(self.gen, track)
 
     @work(thread=True)
     def resolve_worker(self, gen: int, track: dict) -> None:
@@ -1459,6 +1526,7 @@ class ScPlay(App):
         except Exception as e:
             self.call_from_thread(self.on_load_error, gen, e)
             return
+        self.cache_put(track, info)
         self.call_from_thread(self.on_resolved, gen, track, info)
 
     def on_load_error(self, gen: int, err: Exception) -> None:
@@ -1474,35 +1542,55 @@ class ScPlay(App):
         else:
             self.stop_playback()
 
-    def on_resolved(self, gen: int, track: dict, info: dict) -> None:
+    def on_resolved(
+        self, gen: int, track: dict, info: dict, cached: bool = False
+    ) -> None:
         if gen != self.gen:
             return
         if self.mpv is None:
             if self._mpv_starting:  # mpv ещё стартует — ждём
-                self.set_timer(0.3, lambda: self.on_resolved(gen, track, info))
+                self.set_timer(0.3, lambda: self.on_resolved(gen, track, info, cached))
                 return
             if self._mpv_retry_gen != gen:  # не запустился — одна попытка перезапуска
                 self._mpv_retry_gen = gen
                 self.start_mpv()
-                self.set_timer(0.5, lambda: self.on_resolved(gen, track, info))
+                self.set_timer(0.5, lambda: self.on_resolved(gen, track, info, cached))
                 return
             self.notice(self.mpv_error or "mpv недоступен", 10)
             self.stop_playback()
             return
         self._errors = 0
         self.duration = float(info.get("duration") or track.get("duration") or 0)
+        url = info["url"]
+        handed_off = False
+        if self._handoff_ok:  # mpv сам перешёл на заранее добавленный трек
+            try:
+                handed_off = self.mpv.command("get_property", "path") == url
+            except Exception:
+                handed_off = False
         try:
-            self.mpv.command("loadfile", info["url"], "replace")
+            if not handed_off:
+                self.mpv.command("loadfile", url, "replace")
             self.mpv.pause = False
         except Exception as e:
             self.notice(f"Ошибка mpv: {clip(str(e), 70)}", 8)
             return
+        self.mpv_next_url = None
+        if not cached:
+            self._retry_url = None
+        self._cached_play = cached
         self._pos, self._pos_t, self.started = 0.0, time.monotonic(), False
-        self.analyzer = Analyzer(info["url"], self.duration)
+        if self.next_analyzer and self.next_analyzer[0] == url:
+            self.analyzer = self.next_analyzer[1]  # звук уже декодирован заранее
+            self.next_analyzer = None
+        else:
+            self.analyzer = Analyzer(url, self.duration)
         self.state = "playing"
         self.refill()
 
     def stop_playback(self) -> None:
+        self.stop_next_analyzer()
+        self.mpv_next_url = None
         self.gen += 1
         self.state = "idle"
         self.current = None
@@ -1517,31 +1605,127 @@ class ScPlay(App):
             pass
         self.refill()
 
+    def next_index(self, auto: bool = False) -> int | None:
+        """Какой трек играет следующим (None — очередь закончилась)."""
+        n = len(self.queue)
+        if not n or self.idx < 0:
+            return None
+        if auto and self.repeat == 2:
+            return self.idx
+        if self.shuffle and n > 1:
+            cand = self.next_idx
+            if cand is None or cand == self.idx or not (0 <= cand < n):
+                cand = random.choice([i for i in range(n) if i != self.idx])
+                self.next_idx = cand
+            return cand
+        nxt = self.idx + 1
+        if nxt >= n:
+            return 0 if self.repeat == 1 else None
+        return nxt
+
     def advance(self, step: int, auto: bool = False) -> None:
         n = len(self.queue)
         if not n:
             return
-        if auto and self.repeat == 2:
-            return self.play_index(self.idx)
         if step < 0:
+            if auto and self.repeat == 2:
+                return self.play_index(self.idx)
             if self.position() > 3 and not auto:
                 return self.seek_to(0)
             nxt = self.idx - 1
             if nxt < 0:
                 nxt = n - 1 if self.repeat == 1 else 0
             return self.play_index(nxt)
-        if self.shuffle and n > 1:
-            return self.play_index(
-                random.choice([i for i in range(n) if i != self.idx])
-            )
-        nxt = self.idx + 1
-        if nxt >= n:
-            if self.repeat == 1:
-                nxt = 0
-            else:
-                self.notice("Конец очереди")
-                return self.stop_playback()
+        nxt = self.next_index(auto)
+        if nxt is None:
+            self.notice("Конец очереди")
+            return self.stop_playback()
         self.play_index(nxt)
+
+    # ---------- кэш ссылок и подготовка следующего трека
+    def cache_get(self, track: dict) -> dict | None:
+        e = self.cache.get(track["url"])
+        if e and time.monotonic() - e[0] < CACHE_TTL:
+            return e[1]
+        return None
+
+    def cache_put(self, track: dict, info: dict) -> None:
+        self.cache[track["url"]] = (time.monotonic(), info)
+        while len(self.cache) > CACHE_MAX:
+            self.cache.pop(min(self.cache, key=lambda k: self.cache[k][0]))
+
+    def invalidate_prefetch(self) -> None:
+        """Очередь / шаффл / повтор изменились — выбрать следующий трек заново."""
+        self.next_idx = None
+        self._pf_key = None
+
+    def stop_next_analyzer(self) -> None:
+        if self.next_analyzer:
+            self.next_analyzer[1].stop()
+            self.next_analyzer = None
+
+    def _maybe_prefetch(self) -> None:
+        if self.state != "playing" or not self.mpv or not self.started:
+            return
+        if self.duration and self.duration - self.position() > PREFETCH_LEAD:
+            return  # длинный трек: ссылка протухнет, ждём
+        nxt = self.next_index(auto=True)
+        key = (self.gen, nxt, len(self.queue))
+        if key == self._pf_key:
+            return
+        self._pf_key = key
+        if nxt is None or not (0 <= nxt < len(self.queue)):
+            self._clear_next()
+            return
+        track = self.queue[nxt]
+        info = self.cache_get(track)
+        if info:
+            self._append_next(info)
+        else:
+            self.prefetch_worker(self.gen, nxt, track)
+
+    @work(thread=True)
+    def prefetch_worker(self, gen: int, nxt: int, track: dict) -> None:
+        try:
+            info = resolve_stream(track, self.cfg)
+        except Exception:
+            return  # ошибку покажет обычная загрузка
+        self.cache_put(track, info)
+        self.call_from_thread(self._prefetch_done, gen, nxt, info)
+
+    def _prefetch_done(self, gen: int, nxt: int, info: dict) -> None:
+        if (
+            gen != self.gen
+            or self.state != "playing"
+            or self.next_index(auto=True) != nxt
+        ):
+            return
+        self._append_next(info)
+
+    def _append_next(self, info: dict) -> None:
+        """Кладём следующий трек в плейлист mpv: он откроет его заранее и перейдёт без пауз."""
+        url = info["url"]
+        if not self.mpv or self.mpv_next_url == url:
+            return
+        try:
+            self.mpv.command("playlist-clear")
+            self.mpv.command("loadfile", url, "append")
+            self.mpv_next_url = url
+        except Exception:
+            self.mpv_next_url = None
+            return
+        if not (self.next_analyzer and self.next_analyzer[0] == url):
+            self.stop_next_analyzer()
+            self.next_analyzer = (url, Analyzer(url, info.get("duration")))
+
+    def _clear_next(self) -> None:
+        if self.mpv_next_url and self.mpv:
+            try:
+                self.mpv.command("playlist-clear")
+            except Exception:
+                pass
+        self.mpv_next_url = None
+        self.stop_next_analyzer()
 
     # ---------- управление
     def action_pause(self) -> None:
@@ -1589,10 +1773,12 @@ class ScPlay(App):
 
     def action_shuffle(self) -> None:
         self.shuffle = not self.shuffle
+        self.invalidate_prefetch()
         self.notice("Шаффл: " + ("вкл" if self.shuffle else "выкл"), 3)
 
     def action_repeat(self) -> None:
         self.repeat = (self.repeat + 1) % 3
+        self.invalidate_prefetch()
         self.notice("Повтор: " + REPEAT_NAMES[self.repeat], 3)
 
     def action_enqueue(self) -> None:
@@ -1604,6 +1790,7 @@ class ScPlay(App):
             self.enqueue_playlist(tr["url"])
             return
         self.queue.append(tr)
+        self.invalidate_prefetch()
         self.notice(
             f"В очереди: {len(self.queue)}  (добавлено «{clip(tr['title'], 40)}»)", 4
         )
@@ -1624,6 +1811,7 @@ class ScPlay(App):
     def _extend_queue(self, items: list[dict]) -> None:
         first = len(self.queue)
         self.queue.extend(items)
+        self.invalidate_prefetch()
         self.notice(f"Добавлено треков: {len(items)}. В очереди: {len(self.queue)}", 4)
         if self.state == "idle" and items:
             self.play_index(first)
@@ -1635,6 +1823,7 @@ class ScPlay(App):
         if not (0 <= row < len(self.queue)):
             return
         del self.queue[row]
+        self.invalidate_prefetch()
         if row < self.idx:
             self.idx -= 1
         elif row == self.idx:
@@ -1646,6 +1835,7 @@ class ScPlay(App):
         save_cfg(self.cfg)
         if self.analyzer:
             self.analyzer.stop()
+        self.stop_next_analyzer()
         self.stop_mpv()
         self.exit()
 
@@ -1676,14 +1866,30 @@ class ScPlay(App):
         if self._eof:
             reason, self._eof = self._eof, None
             if self.state == "playing":
-                if reason == "error":
-                    self.notice(
-                        "Ошибка воспроизведения"
-                        + (f" ({self._eof_detail})" if self._eof_detail else "")
-                        + ", пробую следующий трек",
-                        6,
-                    )
-                self.advance(+1, auto=True)
+                tr = self.current
+                if (
+                    reason == "error"
+                    and tr
+                    and self._cached_play
+                    and self._retry_url != tr["url"]
+                ):
+                    self._retry_url = tr["url"]  # ссылка из кэша протухла — берём новую
+                    self.cache.pop(tr["url"], None)
+                    self.notice("Ссылка устарела, загружаю заново…", 4)
+                    self.play_index(self.idx)
+                else:
+                    if reason == "error":
+                        self.notice(
+                            "Ошибка воспроизведения"
+                            + (f" ({self._eof_detail})" if self._eof_detail else "")
+                            + ", пробую следующий трек",
+                            6,
+                        )
+                    self._handoff_ok = reason == "eof"
+                    self.advance(+1, auto=True)
+                    self._handoff_ok = False
+        if self._frame % 10 == 0:
+            self._maybe_prefetch()
         spec = self.query_one("#spec")
         nb = self.bars_for(spec.size.width)
         new = None
@@ -1851,6 +2057,8 @@ class ScPlay(App):
         )
         if self.buffering and self.state == "playing":
             mid = "буферизация…  ·  " + mid
+        elif self.mpv_next_url and self.state == "playing":
+            mid = "дальше: готово  ·  " + mid
         room = max(w - len(left) - len(right) - 2, 0)
         t = Text(no_wrap=True, overflow="crop")
         t.append(left, style=P["text"])
