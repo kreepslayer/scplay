@@ -18,16 +18,21 @@
 from __future__ import annotations
 
 import atexit
+import bisect
+import hashlib
 import json
 import os
-import random
 import platform
+import random
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -35,7 +40,7 @@ for _exe in ("mpv", "ffmpeg"):
     if not shutil.which(_exe):
         sys.exit(
             f"Не найден {_exe}. Установи его и добавь в PATH "
-            f"(brew install {_exe} / apt install {_exe} / winget install {_exe})."
+            f"(brew install {_exe} / apt install {_exe} / scoop install {_exe})."
         )
 
 try:
@@ -57,6 +62,7 @@ except ImportError as e:  # pragma: no cover
 
 CONFIG_PATH = Path.home() / ".config" / "scplay" / "config.json"
 MPV_LOG = CONFIG_PATH.parent / "mpv.log"
+LYRICS_DIR = CONFIG_PATH.parent / "lyrics"
 
 SR = 16000  # частота дискретизации для анализа (моно)
 FFT_N = 2048  # окно спектра
@@ -114,9 +120,14 @@ THEMES = {
     ),
 }
 
-VIEWS = ["search", "likes", "sets", "mine", "queue"]
-TAB_NAMES = ["Поиск", "Лайки", "Плейлисты", "Мои треки", "Очередь"]
+VIEWS = ["search", "likes", "sets", "mine", "queue", "lyrics"]
+TAB_NAMES = ["Поиск", "Лайки", "Плейлисты", "Мои треки", "Очередь", "Текст"]
 REPEAT_NAMES = ["выкл", "все", "один"]
+
+LRCLIB_URL = "https://lrclib.net/api/"
+USER_AGENT = "scplay/0.3.0"
+LYRICS_MAX_DIFF = 11.0  # на сколько секунд длительность версии может отличаться
+LYRICS_MISS_TTL = 24 * 3600  # «текст не найден» не перепроверяем сутки
 
 CACHE_TTL = 20 * 60  # сколько секунд ссылка на поток считается свежей
 CACHE_MAX = 12  # максимум ссылок в кэше
@@ -151,7 +162,8 @@ KEYS = [
     ("a", "в очередь"),
     ("d", "убрать"),
     ("/", "поиск"),
-    ("1-5", "вкладки"),
+    ("1-6", "вкладки"),
+    ("l", "текст"),
     ("L", "вход"),
     ("t", "тема"),
     ("q", "выход"),
@@ -419,6 +431,187 @@ def fetch_me(token: str):
             return json.loads(r.read().decode("utf-8"))
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- тексты песен
+
+_BRACKETS = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
+_FEAT = re.compile(r"\s+(?:feat\.?|ft\.?|featuring|при уч\.?)\s+.*$", re.I)
+_EXT = re.compile(r"\.(mp3|flac|wav|m4a|ogg|opus|aac|wma)$", re.I)
+_STAMP = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+
+
+_PIPE_TAIL = re.compile(r"\s+\|\s+.*$")
+
+
+def clean_name(s: str, pipe: bool = True) -> str:
+    """Название трека без мусора: расширение, скобки (remix, official video...), feat."""
+    s = _EXT.sub("", s or "")
+    s = _BRACKETS.sub(" ", s)
+    s = _FEAT.sub("", s)
+    if pipe:
+        s = _PIPE_TAIL.sub("", s)
+    return re.sub(r"\s+", " ", s).strip(" -–—|_\"'")
+
+
+def guess_names(title: str, uploader: str = "") -> list[tuple[str, str]]:
+    """Варианты (исполнитель, название): SoundCloud-заголовки часто вида «Артист - Трек»."""
+    raw = clean_name(title, pipe=False)
+    t = clean_name(title)
+    out: list[tuple[str, str]] = []
+    for sep in (" - ", " – ", " — "):
+        if sep in raw:
+            a, b = raw.split(sep, 1)
+            out.append((clean_name(a), clean_name(b)))
+            break
+    up = clean_name(uploader) if uploader and uploader != "локальный файл" else ""
+    out.append((up, t))
+    out.append(("", t))
+    seen, uniq = set(), []
+    for a, b in out:
+        if b and (a.lower(), b.lower()) not in seen:
+            seen.add((a.lower(), b.lower()))
+            uniq.append((a, b))
+    return uniq
+
+
+def parse_lrc(text: str) -> list[tuple[float, str]]:
+    """LRC -> [(секунда, строка)] по возрастанию времени."""
+    lines: list[tuple[float, str]] = []
+    offset = 0.0
+    for raw in (text or "").splitlines():
+        raw = raw.strip()
+        m = re.match(r"\[offset:\s*([+-]?\d+)\s*\]", raw, re.I)
+        if m:
+            offset = int(m.group(1)) / 1000.0
+            continue
+        stamps = list(_STAMP.finditer(raw))
+        if not stamps:
+            continue
+        body = raw[stamps[-1].end() :].strip()
+        for st in stamps:
+            mm, ss, frac = st.groups()
+            t = int(mm) * 60 + int(ss) + (int(frac) / 10 ** len(frac) if frac else 0.0)
+            lines.append((max(t - offset, 0.0), body))
+    lines.sort(key=lambda x: x[0])
+    return lines
+
+
+def http_get_json(endpoint: str, params: dict, timeout: float = 8.0):
+    url = LRCLIB_URL + endpoint + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def pick_lyrics(results, duration: float | None) -> dict | None:
+    """Выбирает лучшую запись: сначала близкая длительность, затем с таймкодами."""
+    best, best_score = None, None
+    for r in results if isinstance(results, list) else []:
+        if not isinstance(r, dict):
+            continue
+        synced = (r.get("syncedLyrics") or "").strip()
+        plain = (r.get("plainLyrics") or "").strip()
+        instrumental = bool(r.get("instrumental"))
+        if not (synced or plain or instrumental):
+            continue
+        d = r.get("duration")
+        diff = abs(float(d) - float(duration)) if (d and duration) else 0.0
+        if diff > LYRICS_MAX_DIFF:
+            continue
+        score = (-round(diff / 2.0), bool(synced), -diff)
+        if best_score is None or score > best_score:
+            best, best_score = (synced, plain, instrumental), score
+    if best is None:
+        return None
+    synced, plain, instrumental = best
+    lines = parse_lrc(synced) if synced else []
+    if lines:
+        return {
+            "status": "ready",
+            "synced": True,
+            "lines": lines,
+            "plain": [],
+            "source": "lrclib.net",
+        }
+    if plain:
+        return {
+            "status": "ready",
+            "synced": False,
+            "lines": [],
+            "plain": plain.splitlines(),
+            "source": "lrclib.net",
+        }
+    return {
+        "status": "instrumental",
+        "synced": False,
+        "lines": [],
+        "plain": [],
+        "source": "lrclib.net",
+    }
+
+
+def fetch_lyrics(track: dict) -> dict:
+    """Ищет текст в LRCLIB. Ошибки сети пробрасываются наверх."""
+    dur = track.get("duration") or 0
+    names = guess_names(track.get("title", ""), track.get("uploader", ""))
+    for artist, title in names[:3]:
+        params = {"track_name": title}
+        if artist:
+            params["artist_name"] = artist
+        pick = pick_lyrics(http_get_json("search", params), dur)
+        if pick:
+            return pick
+    if names:
+        q = " ".join(x for x in names[0] if x)
+        pick = pick_lyrics(http_get_json("search", {"q": q}), dur)
+        if pick:
+            return pick
+    return {"status": "none", "synced": False, "lines": [], "plain": [], "source": ""}
+
+
+def _lyrics_cache_file(track: dict) -> Path:
+    key = f'{track.get("url", "")}|{track.get("title", "")}'
+    return LYRICS_DIR / (hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
+
+
+def get_lyrics(track: dict) -> dict:
+    """Текст для трека: .lrc рядом с локальным файлом -> кэш на диске -> LRCLIB."""
+    url = track.get("url", "")
+    if url and os.path.exists(url):
+        side = Path(url).with_suffix(".lrc")
+        if side.exists():
+            lines = parse_lrc(side.read_text(encoding="utf-8", errors="replace"))
+            if lines:
+                return {
+                    "status": "ready",
+                    "synced": True,
+                    "lines": lines,
+                    "plain": [],
+                    "source": "локальный .lrc",
+                }
+    f = _lyrics_cache_file(track)
+    try:
+        c = json.loads(f.read_text(encoding="utf-8"))
+        fresh = (
+            c.get("status") != "none"
+            or time.time() - c.get("saved", 0) < LYRICS_MISS_TTL
+        )
+        if fresh and c.get("status") in ("ready", "none", "instrumental"):
+            c["lines"] = [(float(t), x) for t, x in c.get("lines", [])]
+            return c
+    except Exception:
+        pass
+    data = fetch_lyrics(track)
+    try:
+        LYRICS_DIR.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            json.dumps({**data, "saved": time.time()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return data
 
 
 # ---------------------------------------------------------------- анализатор звука
@@ -829,6 +1022,12 @@ def diagnose() -> None:
     if ok_local:
         step("анализатор (ffmpeg → numpy) для визуализатора", analyzer_test)
     app.stop_mpv()
+    print("\n[тексты песен] проверка lrclib.net")
+    try:
+        res = http_get_json("search", {"track_name": "test"}, timeout=10)
+        print(f"  ✓ сервис доступен (ответ: {len(res)} записей)")
+    except Exception as e:
+        print(f"  ✗ lrclib.net недоступен: {e}")
     print("\nПришли этот вывод целиком — по нему будет видно, на каком шаге падает.")
 
 
@@ -862,6 +1061,36 @@ class KeyBar(Live):
             self.styles.height = n
 
 
+class LyricsView(Live):
+    """Панель текста: колесо и ↑/↓ листают обычный текст, клик по строке перематывает."""
+
+    can_focus = True
+    BINDINGS = [
+        Binding("up", "lyr_scroll(-1)", show=False),
+        Binding("down", "lyr_scroll(1)", show=False),
+        Binding("pageup", "lyr_scroll(-10)", show=False),
+        Binding("pagedown", "lyr_scroll(10)", show=False),
+        Binding("home", "lyr_scroll(-100000)", show=False),
+        Binding("end", "lyr_scroll(100000)", show=False),
+    ]
+
+    def action_lyr_scroll(self, d: int) -> None:
+        self.app.lyrics_scroll(d)
+
+    def on_mouse_scroll_up(self, event) -> None:
+        self.app.lyrics_scroll(-3)
+        event.stop()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        self.app.lyrics_scroll(3)
+        event.stop()
+
+    def on_click(self, event: events.Click) -> None:
+        off = event.get_content_offset(self)
+        if off is not None:
+            self.app.lyrics_click(off.y)
+
+
 # ---------------------------------------------------------------- приложение
 
 
@@ -883,6 +1112,9 @@ class ScPlay(App):
     #list { height: 1fr; background: $sc-bg; border: round $sc-line; padding: 0 1;
             border-title-color: $sc-dim; border-subtitle-color: $sc-faint; }
     #list:focus { border: round $sc-accent; }
+    #lyrics { height: 1fr; background: $sc-bg; border: round $sc-line; padding: 0 1; display: none;
+              border-title-color: $sc-dim; border-subtitle-color: $sc-faint; }
+    #lyrics:focus { border: round $sc-accent; }
     DataTable > .datatable--header { background: $sc-bg; color: $sc-faint; text-style: none; }
     DataTable > .datatable--cursor { background: $sc-surface; color: $sc-accent2; text-style: bold; }
     DataTable:focus > .datatable--cursor { background: $sc-surface; color: $sc-accent2; text-style: bold; }
@@ -916,6 +1148,10 @@ class ScPlay(App):
         Binding("3", "view(2)", "Плейлисты"),
         Binding("4", "view(3)", "Мои треки"),
         Binding("5", "view(4)", "Очередь"),
+        Binding("6", "view(5)", "Текст"),
+        Binding("l", "lyrics", "Текст"),
+        Binding("left_square_bracket", "lyrics_shift(-0.5)", "Текст позже"),
+        Binding("right_square_bracket", "lyrics_shift(0.5)", "Текст раньше"),
         Binding("t", "theme", "Тема"),
         Binding("q", "quit_app", "Выход"),
     ]
@@ -966,6 +1202,11 @@ class ScPlay(App):
         self._frame = 0
         # списки
         self.view = "search"
+        self.prev_view = "search"
+        self.lyr = self._new_lyr(None, "idle")
+        self.lyr_offset = 0.0
+        self._lyr_rows: list = []
+        self._lyr_total = 0
         self.lists: dict[str, list] = {
             "search": [],
             "likes": [],
@@ -1002,6 +1243,7 @@ class ScPlay(App):
                 placeholder="найти музыку…   (Enter — искать · Esc — назад)", id="bar"
             )
         yield DataTable(id="list", cursor_type="row", zebra_stripes=False)
+        yield LyricsView(self.r_lyrics, id="lyrics")
         yield Live(self.r_notice, id="notice")
         with Vertical(id="np"):
             yield Live(self.r_title, id="title")
@@ -1013,6 +1255,7 @@ class ScPlay(App):
     def on_mount(self) -> None:
         self.query_one("#list", DataTable).focus()
         self.query_one("#np").border_title = " сейчас играет "
+        self.query_one("#lyrics").border_title = " текст "
         self.refill()
         self.set_interval(1 / 20, self.tick)
         self._ui_ready = True
@@ -1242,9 +1485,14 @@ class ScPlay(App):
 
     # ---------- списки
     def current_items(self) -> list[dict]:
-        return self.queue if self.view == "queue" else self.lists[self.view]
+        return self.queue if self.view == "queue" else self.lists.get(self.view, [])
 
     def refill(self, reset: bool = False) -> None:
+        lv = self.view == "lyrics"
+        self.query_one("#list").display = not lv
+        self.query_one("#lyrics").display = lv
+        if lv:
+            return
         t = self.query_one("#list", DataTable)
         P = self.pal
         keep = 0 if reset else t.cursor_row
@@ -1305,9 +1553,14 @@ class ScPlay(App):
     def action_view(self, i: int) -> None:
         name = VIEWS[i]
         again = name == self.view
+        if self.view != "lyrics" and name == "lyrics":
+            self.prev_view = self.view
         self.view = name
         self.refill(reset=True)
-        self.query_one("#list", DataTable).focus()
+        self.focus_main()
+        if name == "lyrics":
+            self._lyrics_opened()
+            return
         if name in ("likes", "sets", "mine"):
             if not self.cfg.get("profile"):
                 self.notice("Для этой вкладки нужен вход — нажми L", 6)
@@ -1315,7 +1568,7 @@ class ScPlay(App):
                 self.load_view(name)
         elif name == "queue" and not self.queue:
             self.notice("Очередь пуста. Нажми a на треке, чтобы добавить", 5)
-        elif name == "search" and not self.lists["search"]:
+        elif name == "search" and not self.lists["search"] and self.state == "idle":
             self.notice("Нажми /, чтобы найти музыку", 5)
 
     @work(thread=True)
@@ -1359,14 +1612,17 @@ class ScPlay(App):
         self.refill()
         self.notice(f"Тема: {self.sc_theme}", 3)
 
+    def focus_main(self) -> None:
+        self.query_one("#lyrics" if self.view == "lyrics" else "#list").focus()
+
     def action_focus_list(self) -> None:
-        self.query_one("#list", DataTable).focus()
+        self.focus_main()
 
     def on_input_submitted(self, ev: Input.Submitted) -> None:
         text = ev.value.strip()
         mode, self.input_mode = self.input_mode, "search"
         ev.input.value = ""
-        self.query_one("#list", DataTable).focus()
+        self.focus_main()
         if not text:
             return
         if mode == "login":
@@ -1375,6 +1631,8 @@ class ScPlay(App):
             self.start_initial(text)
         else:
             self.view = "search"
+            self.refill(reset=True)
+            self.focus_main()
             self.notice(f"Ищу «{text}»…", 30)
             self.do_search(text)
 
@@ -1457,6 +1715,7 @@ class ScPlay(App):
             self.open_url(arg)
         else:
             self.view = "search"
+            self.refill(reset=True)
             self.notice(f"Ищу «{arg}»…", 30)
             self.do_search(arg)
 
@@ -1587,8 +1846,15 @@ class ScPlay(App):
             self.analyzer = Analyzer(url, self.duration)
         self.state = "playing"
         self.refill()
+        self.lyr = self._new_lyr(track["url"], "pending")
+        self.lyr_offset = 0.0
+        delay = (
+            0.05 if self.view == "lyrics" else 1.5
+        )  # при быстром листании не дёргаем сервис
+        self.set_timer(delay, lambda g=gen: self._kick_lyrics(g))
 
     def stop_playback(self) -> None:
+        self.lyr = self._new_lyr(None, "idle")
         self.stop_next_analyzer()
         self.mpv_next_url = None
         self.gen += 1
@@ -1604,6 +1870,94 @@ class ScPlay(App):
         except Exception:
             pass
         self.refill()
+
+    # ---------- тексты песен
+    @staticmethod
+    def _new_lyr(url, status: str) -> dict:
+        return {
+            "url": url,
+            "status": status,
+            "synced": False,
+            "lines": [],
+            "times": [],
+            "plain": [],
+            "source": "",
+            "scroll": 0,
+        }
+
+    def _kick_lyrics(self, gen: int) -> None:
+        if gen != self.gen or not self.current or self.lyr.get("status") != "pending":
+            return
+        if self.cfg.get("lyrics", True) is False:
+            self.lyr["status"] = "off"
+            return
+        self.lyr["status"] = "loading"
+        self.lyrics_worker(self.current)
+
+    @work(thread=True)
+    def lyrics_worker(self, track: dict) -> None:
+        try:
+            data = get_lyrics(track)
+        except Exception as e:
+            data = {"status": "error", "error": str(e)}
+        self.call_from_thread(self._lyrics_done, track["url"], data)
+
+    def _lyrics_done(self, url: str, data: dict) -> None:
+        if self.lyr.get("url") != url:
+            return  # трек уже сменился
+        self.lyr.update(data)
+        self.lyr["times"] = [t for t, _ in self.lyr.get("lines", [])]
+
+    def _lyrics_opened(self) -> None:
+        if self.lyr.get("status") == "pending" and self.current:
+            self._kick_lyrics(self.gen)
+        if self.lyr.get("status") == "ready" and self.lyr.get("synced"):
+            self.notice("Клик по строке — перемотка · [ ] — подогнать синхронизацию", 6)
+
+    def action_lyrics(self) -> None:
+        if self.view == "lyrics":
+            back = VIEWS.index(self.prev_view) if self.prev_view in VIEWS else 0
+            self.action_view(back if VIEWS[back] != "lyrics" else 0)
+        else:
+            self.action_view(VIEWS.index("lyrics"))
+
+    def action_lyrics_shift(self, d: float) -> None:
+        if self.lyr.get("status") != "ready" or not self.lyr.get("synced"):
+            return
+        self.lyr_offset = round(self.lyr_offset + d, 1)
+        self.notice(f"Сдвиг текста: {self.lyr_offset:+.1f} с", 3)
+
+    def lyrics_scroll(self, d: int) -> None:
+        if self.lyr.get("status") == "ready" and not self.lyr.get("synced"):
+            self.lyr["scroll"] = max(0, self.lyr.get("scroll", 0) + d)
+
+    def lyrics_click(self, y: int) -> None:
+        if not (self.lyr.get("status") == "ready" and self.lyr.get("synced")):
+            return
+        if 0 <= y < len(self._lyr_rows) and self._lyr_rows[y] is not None:
+            t = self.lyr["times"][self._lyr_rows[y]]
+            self.seek_to(t - self.lyr_offset)
+
+    def current_lyric(self) -> str | None:
+        L = self.lyr
+        if self.state != "playing" or L.get("status") != "ready" or not L.get("synced"):
+            return None
+        i = bisect.bisect_right(L["times"], self.position() + self.lyr_offset) - 1
+        if i < 0:
+            return None
+        return L["lines"][i][1] or None
+
+    def lyrics_subtitle(self) -> str:
+        L = self.lyr
+        if L.get("status") != "ready":
+            return ""
+        parts = [L.get("source", "")]
+        parts.append(
+            "синхронизирован" if L.get("synced") else "без синхронизации · ↑/↓"
+        )
+        if self.lyr_offset:
+            parts.append(f"сдвиг {self.lyr_offset:+.1f} с")
+        return " " + " · ".join(p for p in parts if p) + " "
 
     def next_index(self, auto: bool = False) -> int | None:
         """Какой трек играет следующим (None — очередь закончилась)."""
@@ -1919,6 +2273,10 @@ class ScPlay(App):
         if self._frame % 5 == 0:
             self.query_one("#tabs").refresh()
             self.query_one("#prompt").refresh()
+        if self.view == "lyrics" and self._frame % 3 == 0:
+            lw = self.query_one("#lyrics")
+            lw.border_subtitle = self.lyrics_subtitle()
+            lw.refresh()
 
     @staticmethod
     def bars_for(width: int) -> int:
@@ -1933,6 +2291,86 @@ class ScPlay(App):
         t.append(" " + label.ljust(6), style=P["dim"] if not focused else P["text"])
         t.append(" ❯ ", style=P["accent"] if focused else P["faint"])
         return t
+
+    def r_lyrics(self, w: int, h: int) -> Text:
+        P = self.pal
+        L = self.lyr
+        st = L.get("status")
+
+        def msg(t: str, style=None) -> Text:
+            rows = [Text("") for _ in range(h)]
+            rows[h // 2] = Text(clip(t, w).center(w), style=style or P["faint"])
+            self._lyr_rows = []
+            return Text("\n").join(rows)
+
+        if self.state == "idle" or not self.current:
+            return msg("ничего не играет")
+        if st in ("pending", "loading", "idle"):
+            return msg("ищу текст…")
+        if st == "off":
+            return msg('тексты отключены ("lyrics": false в config.json)')
+        if st == "error":
+            return msg("не удалось загрузить текст — проверь сеть", P["err"])
+        if st == "instrumental":
+            return msg("♪ инструментал")
+        if st != "ready":
+            return msg("текст не найден")
+        width = max(w - 4, 10)
+
+        def wrap(txt: str) -> list[str]:
+            return textwrap.wrap(txt, width) or [""]
+
+        if not L["synced"]:
+            rows = [r for ln in L["plain"] for r in wrap(ln)]
+            self._lyr_total = len(rows)
+            scroll = min(max(L.get("scroll", 0), 0), max(len(rows) - h, 0))
+            L["scroll"] = scroll
+            self._lyr_rows = []
+            out = [
+                Text(r.center(w), style=P["text"]) for r in rows[scroll : scroll + h]
+            ]
+            out += [Text("") for _ in range(h - len(out))]
+            return Text("\n").join(out)
+
+        lines, times = L["lines"], L["times"]
+        n = len(lines)
+        c = bisect.bisect_right(times, self.position() + self.lyr_offset) - 1
+
+        def block(i: int) -> list[str]:
+            return wrap(lines[i][1] or "♪")
+
+        cur = [(r, c) for r in block(c)] if c >= 0 else []
+        need_above = max((h - len(cur)) // 2, 0) if c >= 0 else h // 2
+        need_below = h - len(cur) - need_above
+        above: list = []
+        i = c - 1
+        while len(above) < need_above and i >= 0:
+            above = [(r, i) for r in block(i)] + above
+            i -= 1
+        above = above[-need_above:] if need_above else []
+        below: list = []
+        j = c + 1 if c >= 0 else 0
+        while len(below) < need_below and j < n:
+            below += [(r, j) for r in block(j)]
+            j += 1
+        below = below[:need_below]
+        rows = [("", None)] * (need_above - len(above)) + above + cur + below
+        rows += [("", None)] * (h - len(rows))
+        self._lyr_rows = [idx for _, idx in rows]
+        out = []
+        for txt, idx in rows:
+            if idx is None:
+                style = P["faint"]
+            elif idx == c:
+                style = f"bold {P['accent2']}"
+            elif idx == c + 1 and c >= 0 or (c < 0 and idx == 0):
+                style = P["text"]
+            elif idx > c:
+                style = P["dim"]
+            else:
+                style = P["faint"]
+            out.append(Text(txt.center(w), style=style))
+        return Text("\n").join(out)
 
     def r_tabs(self, w: int, h: int) -> Text:
         P = self.pal
@@ -1966,7 +2404,12 @@ class ScPlay(App):
                 no_wrap=True,
                 overflow="crop",
             )
-        hint = "Enter — играть  ·  / — искать  ·  1–5 — вкладки  ·  t — тема"
+        cur = self.current_lyric() if self.view != "lyrics" else None
+        if cur:
+            return Text(
+                clip("♪ " + cur, w), style=P["dim"], no_wrap=True, overflow="crop"
+            )
+        hint = "Enter — играть  ·  / — искать  ·  1–6 — вкладки  ·  t — тема"
         return Text(clip(hint, w), style=P["faint"], no_wrap=True, overflow="crop")
 
     def r_title(self, w: int, h: int) -> Text:
