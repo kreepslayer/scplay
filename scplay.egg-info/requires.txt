@@ -1,4 +1,0 @@
-yt-dlp
-textual>=1.0
-numpy
-python-mpv-jsonipc>=1.2
