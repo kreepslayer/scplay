@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
-import atexit
+import argparse
 import bisect
+import faulthandler
 import hashlib
 import json
 import os
@@ -32,16 +33,11 @@ import sys
 import textwrap
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
+import tempfile
 from pathlib import Path
-
-for _exe in ("mpv", "ffmpeg"):
-    if not shutil.which(_exe):
-        sys.exit(
-            f"Не найден {_exe}. Установи его и добавь в PATH "
-            f"(brew install {_exe} / apt install {_exe} / scoop install {_exe})."
-        )
 
 try:
     import numpy as np
@@ -60,9 +56,85 @@ except ImportError as e:  # pragma: no cover
         "Установи:  pip install yt-dlp textual numpy python-mpv-jsonipc"
     )
 
+from scplay_media import COMMANDS, ControlServer, make_media, run_cli
+
 CONFIG_PATH = Path.home() / ".config" / "scplay" / "config.json"
-MPV_LOG = CONFIG_PATH.parent / "mpv.log"
-LYRICS_DIR = CONFIG_PATH.parent / "lyrics"
+CONFIG_DIR = CONFIG_PATH.parent
+MPV_LOG = CONFIG_DIR / "mpv.log"
+LYRICS_DIR = CONFIG_DIR / "lyrics"
+DEBUG_LOG = CONFIG_DIR / "debug.log"
+CRASH_LOG = CONFIG_DIR / "crash.log"
+DEBUG_MAX = 256 * 1024  # держим лог маленьким: он только для разбора проблем
+
+__version__ = "0.4.0"
+
+
+def install_crash_handlers() -> None:
+    """Падение не должно исчезать бесследно.
+
+    Полноэкранный интерфейс при аварии часто оставляет терминал в мусоре, а
+    traceback теряется вместе с экраном. Пишем его в crash.log и возвращаем
+    терминал в нормальное состояние.
+    """
+    def report(kind: str, exc: BaseException) -> None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with CRASH_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {kind} ===\n")
+                for line in traceback.format_exception(type(exc), exc, exc.__traceback__):
+                    fh.write(line)
+                if kind != "uncaught":
+                    fh.write("".join(traceback.format_stack()[-12:]))
+        except Exception:
+            pass
+        try:
+            if os.name != "nt" and sys.stdout.isatty():
+                os.system("stty sane")  # возвращаем эхо и перевод строки
+        except Exception:
+            pass
+
+    def hook(exc_type, exc, tb):
+        report("uncaught", exc)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+
+    def on_signal(signum, _frame):
+        report(f"signal {signum}", SystemExit(f"получен сигнал {signum}"))
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        sys.exit(128 + signum)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, on_signal)
+        except (OSError, ValueError):
+            pass
+
+    # Нативный сбой (например в ctypes-вызове системного фреймворка) Python не
+    # поймает, но faulthandler запишет стек в тот же файл.
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        fh = CRASH_LOG.open("a", encoding="utf-8", errors="replace")
+        fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} сессия запущена ===\n")
+        fh.flush()
+        faulthandler.enable(file=fh, all_threads=True)
+    except Exception:
+        pass
+
+
+def require_tools() -> None:
+    """mpv и ffmpeg обязательны для работы; проверяем до старта интерфейса."""
+    for exe in ("mpv", "ffmpeg"):
+        if not shutil.which(exe):
+            sys.exit(
+                f"Не найден {exe}. Установи его и добавь в PATH "
+                f"(brew install {exe} / apt install {exe} / scoop install {exe})."
+            )
+
 
 SR = 16000  # частота дискретизации для анализа (моно)
 FFT_N = 2048  # окно спектра
@@ -125,7 +197,7 @@ TAB_NAMES = ["Поиск", "Лайки", "Плейлисты", "Мои трек�
 REPEAT_NAMES = ["выкл", "все", "один"]
 
 LRCLIB_URL = "https://lrclib.net/api/"
-USER_AGENT = "scplay/0.3.0"
+USER_AGENT = "scplay/0.4.0"
 LYRICS_MAX_DIFF = 11.0  # на сколько секунд длительность версии может отличаться
 LYRICS_MISS_TTL = 24 * 3600  # «текст не найден» не перепроверяем сутки
 
@@ -134,6 +206,15 @@ CACHE_MAX = 12  # максимум ссылок в кэше
 PREFETCH_LEAD = (
     300  # готовим следующий трек, когда до конца текущего осталось не больше (сек)
 )
+
+# Быстрый путь resolve опирается на приватные методы yt-dlp, поэтому его
+# совместимость проверяется на месте: после нескольких отказов он отключается,
+# и приложение работает обычным (медленным) путём, а не платит за оба.
+FAST_MAX_FAILS = 2
+
+# Какую часть трека держать в памяти для спектра. Вся волна хранится отдельно
+# и компактно (огибающая), поэтому длинные миксы не съедают гигабайты.
+ANALYZER_WINDOW_SEC = 600
 
 # Режимы запуска mpv: по очереди, пока один не заработает.
 MPV_BASE = [
@@ -193,6 +274,126 @@ def clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[: max(n - 1, 0)] + "…"
 
 
+def secure_dir(path: Path) -> None:
+    """Создаёт каталог с правами только для владельца (в кэше текстов — история прослушиваний)."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def secure_file(path: Path) -> None:
+    try:
+        if os.name != "nt":
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+_debug_lock = threading.Lock()
+
+
+def dbg(msg: str) -> None:
+    """Пишет строку в ~/.config/scplay/debug.log (сам усекает файл).
+
+    Нужен там, где ошибку нельзя показать в интерфейсе: иначе сбой resolve,
+    mpv или сети исчезает бесследно и разбирать его нечем.
+    """
+    try:
+        with _debug_lock:
+            secure_dir(CONFIG_DIR)
+            if DEBUG_LOG.exists() and DEBUG_LOG.stat().st_size > DEBUG_MAX:
+                tail = DEBUG_LOG.read_bytes()[-DEBUG_MAX // 2 :]
+                DEBUG_LOG.write_bytes(tail)
+            with DEBUG_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+            secure_file(DEBUG_LOG)
+    except Exception:
+        pass
+
+
+def ipc_socket_path(tag: str = "scplay") -> str:
+    """Путь IPC-сокета mpv: у Unix-сокетов лимит ~104 байта, поэтому
+    вместо $TMPDIR (на macOS он длинный) берём системный временный каталог."""
+    name = f"{tag}-{os.getpid()}"
+    if os.name == "nt":
+        return name  # на Windows это имя именованного канала
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and Path(runtime).is_dir():
+        return os.path.join(runtime, f"{name}.sock")
+    return os.path.join(tempfile.gettempdir(), f"{name}.sock")
+
+
+def cleanup_socket(sock: str) -> None:
+    if os.name != "nt" and sock and sock.startswith("/") and os.path.exists(sock):
+        try:
+            os.remove(sock)
+        except OSError:
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """Грубая, но достаточная проверка живости процесса без знания его владельца."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # процесс есть, просто не наш
+    except OSError:
+        return True
+    return True
+
+
+def watch_parent(proc: subprocess.Popen, interval: float = 2.0) -> None:
+    """Убивает mpv, если scplay умер нештатно (SIGKILL, закрытый терминал).
+
+    Иначе mpv остаётся висеть с --idle=yes, держит звуковое устройство и путает
+    последующие запуски. Штатный выход убивает mpv сам, поток при этом просто
+    завершается вместе с процессом.
+    """
+    parent = os.getpid()
+
+    def run() -> None:
+        while proc.poll() is None:
+            time.sleep(interval)
+            if proc.poll() is not None:
+                return
+            if not _pid_alive(parent):
+                dbg(f"watchdog: родитель {parent} исчез, убиваю mpv {proc.pid}")
+                try:
+                    proc.terminate()
+                    proc.wait(2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return
+
+    threading.Thread(target=run, daemon=True, name="mpv-watchdog").start()
+
+
 class _NullLogger:
     def debug(self, *a):
         pass
@@ -210,19 +411,22 @@ class _NullLogger:
 def load_cfg() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except Exception:
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        dbg(f"config: не удалось прочитать {CONFIG_PATH}: {e!r}")
         return {}
 
 
 def save_cfg(cfg: dict) -> None:
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        secure_dir(CONFIG_DIR)
         CONFIG_PATH.write_text(
             json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        os.chmod(CONFIG_PATH, 0o600)
-    except OSError:
-        pass
+        secure_file(CONFIG_PATH)
+    except OSError as e:
+        dbg(f"config: не удалось сохранить {CONFIG_PATH}: {e!r}")
 
 
 def auth_opts(cfg: dict) -> dict:
@@ -352,13 +556,48 @@ def get_tracks(cfg: dict, url: str, n: int = 200) -> list[dict]:
     return extract_list(url, cfg, n)
 
 
+_fast_fails = 0
+_fast_pinned: bool | None = None
+
+
+def fast_usable() -> bool:
+    """Можно ли пробовать быстрый путь.
+
+    Он держится на приватных методах SoundcloudIE (_download_json, _resolv_url,
+    _CLIENT_ID, _HEADERS). После апдейта yt-dlp они меняются, и тогда запрос
+    падает (например, 401 без client_id) — без этой проверки каждый трек платит
+    и за неудачную попытку, и за полный разбор. Отключить проверку:
+    SCPLAY_FAST_RESOLVE=1/0.
+    """
+    global _fast_pinned
+    if _fast_pinned is None:
+        env = os.environ.get("SCPLAY_FAST_RESOLVE")
+        if env is not None:
+            _fast_pinned = env.strip().lower() not in ("0", "false", "no", "off")
+        else:
+            _fast_pinned = True
+    return bool(_fast_pinned) and _fast_fails < FAST_MAX_FAILS
+
+
+def _fast_failed(err: BaseException) -> None:
+    global _fast_fails
+    _fast_fails += 1
+    dbg(f"resolve: быстрый путь не сработал ({err!r}), отказ {_fast_fails}/{FAST_MAX_FAILS}")
+    if _fast_fails >= FAST_MAX_FAILS:
+        dbg("resolve: быстрый путь отключён до перезапуска, дальше обычный yt-dlp")
+
+
 def fast_resolve(track: dict, cfg: dict) -> dict:
     """Ссылка на поток за 2 запроса: yt-dlp опрашивает все форматы по очереди (4-6 запросов),
     а нужен только один. Любая ошибка -> вызывающий код откатится на обычный yt-dlp."""
     with yt_dlp.YoutubeDL(ydl_base(cfg)) as ydl:
         ie = _sc_ie(ydl, "Soundcloud")
+        resolve_url = ie._resolv_url(track["url"])
+        separator = "&" if "?" in resolve_url else "?"
         info = ie._download_json(
-            ie._resolv_url(track["url"]), "track", headers=ie._HEADERS
+            f"{resolve_url}{separator}client_id={ie._CLIENT_ID}",
+            "track",
+            headers=ie._HEADERS,
         )
         best = None
         for t in (info.get("media") or {}).get("transcodings") or []:
@@ -389,16 +628,25 @@ def fast_resolve(track: dict, cfg: dict) -> dict:
 
 def resolve_stream(track: dict, cfg: dict) -> dict:
     """Возвращает {'url': прямая ссылка на аудио, 'duration': сек}."""
-    if os.path.exists(track["url"]):
+    if os.path.isfile(track["url"]):
         return {"url": track["url"], "duration": track.get("duration")}
-    try:
-        return fast_resolve(track, cfg)
-    except Exception:
-        pass  # запасной путь: полный yt-dlp
+    if fast_usable():
+        try:
+            info = fast_resolve(track, cfg)
+        except Exception as e:
+            _fast_failed(e)
+        else:
+            global _fast_fails
+            _fast_fails = 0
+            return info
     with yt_dlp.YoutubeDL(ydl_base(cfg, format="bestaudio/best")) as ydl:
         info = ydl.extract_info(track["url"], download=False)
+    if not info:
+        raise RuntimeError("yt-dlp не вернул данные о треке")
     if info.get("entries"):
         raise RuntimeError("это плейлист, а не трек")
+    if not info.get("url"):
+        raise RuntimeError("yt-dlp не нашёл ссылку на аудио")
     return {
         "url": info["url"],
         "duration": info.get("duration") or track.get("duration"),
@@ -412,6 +660,7 @@ def get_token(auth: dict):
                 if c.name == "oauth_token" and "soundcloud.com" in c.domain:
                     return c.value, None
     except Exception as e:
+        dbg(f"вход: не удалось прочитать cookie ({auth}): {e!r}")
         return None, str(e)
     return None, None
 
@@ -429,7 +678,8 @@ def fetch_me(token: str):
         )
         with urllib.request.urlopen(req, timeout=15) as r:
             return json.loads(r.read().decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        dbg(f"вход: /me недоступен: {e!r}")
         return None
 
 
@@ -476,7 +726,12 @@ def guess_names(title: str, uploader: str = "") -> list[tuple[str, str]]:
 
 
 def parse_lrc(text: str) -> list[tuple[float, str]]:
-    """LRC -> [(секунда, строка)] по возрастанию времени."""
+    """LRC -> [(секунда, строка)] по возрастанию времени.
+
+    По спецификации LRC `[offset:+N]` сдвигает текст вперёд на N миллисекунд,
+    то есть время строки = метка + offset/1000. Знак раньше был перепутан, из-за
+    чего любой файл/запись с offset ехали не в такт.
+    """
     lines: list[tuple[float, str]] = []
     offset = 0.0
     for raw in (text or "").splitlines():
@@ -492,7 +747,7 @@ def parse_lrc(text: str) -> list[tuple[float, str]]:
         for st in stamps:
             mm, ss, frac = st.groups()
             t = int(mm) * 60 + int(ss) + (int(frac) / 10 ** len(frac) if frac else 0.0)
-            lines.append((max(t - offset, 0.0), body))
+            lines.append((max(t + offset, 0.0), body))
     lines.sort(key=lambda x: x[0])
     return lines
 
@@ -578,7 +833,7 @@ def _lyrics_cache_file(track: dict) -> Path:
 def get_lyrics(track: dict) -> dict:
     """Текст для трека: .lrc рядом с локальным файлом -> кэш на диске -> LRCLIB."""
     url = track.get("url", "")
-    if url and os.path.exists(url):
+    if url and os.path.isfile(url):
         side = Path(url).with_suffix(".lrc")
         if side.exists():
             lines = parse_lrc(side.read_text(encoding="utf-8", errors="replace"))
@@ -600,17 +855,20 @@ def get_lyrics(track: dict) -> dict:
         if fresh and c.get("status") in ("ready", "none", "instrumental"):
             c["lines"] = [(float(t), x) for t, x in c.get("lines", [])]
             return c
-    except Exception:
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        dbg(f"текст: кэш {f.name} испорчен, перезапрашиваю: {e!r}")
     data = fetch_lyrics(track)
     try:
-        LYRICS_DIR.mkdir(parents=True, exist_ok=True)
+        secure_dir(LYRICS_DIR)
         f.write_text(
             json.dumps({**data, "saved": time.time()}, ensure_ascii=False),
             encoding="utf-8",
         )
-    except OSError:
-        pass
+        secure_file(f)
+    except OSError as e:
+        dbg(f"текст: не удалось сохранить кэш: {e!r}")
     return data
 
 
@@ -618,14 +876,23 @@ def get_lyrics(track: dict) -> dict:
 
 
 class Analyzer:
-    """Декодирует трек через ffmpeg в моно-PCM и считает спектр/волну для любой позиции."""
+    """Декодирует трек через ffmpeg в моно-PCM и считает спектр/волну для любой позиции.
 
-    def __init__(self, src: str, duration: float | None):
+    PCM хранится в кольцевом буфере ограниченного размера (ANALYZER_WINDOW_SEC):
+    иначе часовой микс занимал бы ~115 МБ, а трёхчасовой — треть гигабайта.
+    Огибающая волны при этом собирается по всему треку и весит копейки, поэтому
+    полная волна и прогресс остаются на месте.
+    """
+
+    def __init__(self, src: str, duration: float | None, window_sec: float = ANALYZER_WINDOW_SEC):
         self.lock = threading.Lock()
-        cap = int((duration or 600) * SR) + SR * 10
-        self.data = np.zeros(cap, np.int16)
-        self.env = np.zeros(cap // BLK + 8, np.float32)
-        self.n = 0
+        self.cap = max(int(window_sec * SR), FFT_N * 4)
+        self.buf = np.zeros(self.cap, np.int16)
+        self.start = 0  # абсолютный номер сэмпла в buf[0]
+        self.n = 0  # сколько всего сэмплов декодировано
+        # огибающая: ~10 мс на блок, весь трек -> 100 блоков на секунду
+        env_cap = int((duration or 600) * SR / BLK) + 128
+        self.env = np.zeros(env_cap, np.float32)
         self.nbd = 0
         self.done = False
         self.proc = None
@@ -634,6 +901,30 @@ class Analyzer:
         self._wval = None
         self._bands: dict = {}
         threading.Thread(target=self._run, args=(src,), daemon=True).start()
+
+    def _write(self, arr: np.ndarray) -> None:
+        """Дописывает сэмплы в кольцо. Вызывать под self.lock."""
+        m = len(arr)
+        if m >= self.cap:
+            arr, m = arr[-self.cap :], self.cap
+        end = self.n % self.cap
+        room = self.cap - end
+        if m <= room:
+            self.buf[end : end + m] = arr
+        else:
+            self.buf[end:] = arr[:room]
+            self.buf[: m - room] = arr[room:]
+        if self.n + m > self.cap:
+            self.start = self.n + m - self.cap
+        self.n += m
+
+    def _need_env(self, upto_block: int) -> None:
+        """Расширяет огибающую под более длинный трек, чем ожидалось."""
+        if upto_block <= len(self.env):
+            return
+        ne = np.zeros(max(upto_block + 128, len(self.env) * 2), np.float32)
+        ne[: self.nbd] = self.env[: self.nbd]
+        self.env = ne
 
     def _run(self, src: str) -> None:
         try:
@@ -669,29 +960,22 @@ class Analyzer:
                 rem = chunk[k:]
                 arr = np.frombuffer(chunk[:k], dtype="<i2")
                 with self.lock:
-                    need = self.n + len(arr)
-                    if need > len(self.data):
-                        cap = max(len(self.data) * 2, need + SR)
-                        nd = np.zeros(cap, np.int16)
-                        nd[: self.n] = self.data[: self.n]
-                        ne = np.zeros(cap // BLK + 8, np.float32)
-                        ne[: self.nbd] = self.env[: self.nbd]
-                        self.data, self.env = nd, ne
-                    self.data[self.n : need] = arr
-                    self.n = need
+                    self._write(arr)
                     total_blocks = self.n // BLK
                     if total_blocks > self.nbd:
+                        self._need_env(total_blocks)
                         seg = np.abs(
-                            self.data[self.nbd * BLK : total_blocks * BLK].astype(
-                                np.int32
-                            )
+                            self.buf[
+                                self.nbd * BLK - self.start : total_blocks * BLK
+                                - self.start
+                            ].astype(np.int32)
                         )
                         self.env[self.nbd : total_blocks] = seg.reshape(-1, BLK).max(
                             axis=1
                         )
                         self.nbd = total_blocks
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"анализатор: ffmpeg/декод упал на {src[:80]}: {e!r}")
         finally:
             self.done = True
 
@@ -700,8 +984,8 @@ class Analyzer:
         try:
             if self.proc and self.proc.poll() is None:
                 self.proc.kill()
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"анализатор: не удалось остановить ffmpeg: {e!r}")
 
     def _band_tables(self, nb: int):
         if nb not in self._bands:
@@ -717,18 +1001,13 @@ class Analyzer:
     def spectrum(self, t: float, nb: int):
         """Уровни 0..1 для nb полос в момент t; None, если эта часть ещё не декодирована."""
         i = int(t * SR)
-        with self.lock:
-            data, n = self.data, self.n
-        if i < 0 or i >= n:
-            return None
         half = FFT_N // 2
-        a, b = i - half, i + half
-        if a < 0 or b > n:
-            seg = np.zeros(FFT_N, np.float32)
-            lo, hi = max(a, 0), min(b, n)
-            seg[lo - a : hi - a] = data[lo:hi]
-        else:
-            seg = data[a:b].astype(np.float32)
+        with self.lock:
+            n, start, buf = self.n, self.start, self.buf
+            if i < 0 or i >= n or i + half > n or i - start - half < 0:
+                return None  # ещё не декодировано либо уже вытеснено из кольца
+            a = i - start - half
+            seg = buf[a : a + FFT_N].astype(np.float32)
         mag = np.abs(np.fft.rfft(seg / 32768.0 * HANN)) / (HANN.sum() / 2)
         lo, hi, tilt = self._band_tables(nb)
         vals = np.array([mag[l:h].max() for l, h in zip(lo, hi)])
@@ -739,7 +1018,8 @@ class Analyzer:
         """Пики волны по колонкам (0..1) для всего трека; недекодированное = 0."""
         with self.lock:
             env, nbd = self.env, self.nbd
-        key = (cols, int(total_sec), nbd // 300 if not self.done else -1)
+            done = self.done
+        key = (cols, int(total_sec), nbd // 300 if not done else -1)
         if key == self._wkey:
             return self._wval
         total_blocks = total_sec * SR / BLK if total_sec else float(max(nbd, 1))
@@ -777,7 +1057,11 @@ def describe_exit(rc: int) -> str:
 
 def diagnose() -> None:
     """scplay.py --diagnose — проверка mpv/ffmpeg и режимов запуска."""
-    print(f"python {platform.python_version()} · {platform.platform()}")
+    print(
+        f"scplay {__version__} · python {platform.python_version()} · "
+        f"{platform.platform()} · yt-dlp {yt_dlp.version.__version__}"
+    )
+    print(f"быстрый resolve: {'включён' if fast_usable() else 'отключён (обычный yt-dlp)'}")
     dyld = {k: v for k, v in os.environ.items() if k.startswith("DYLD_")}
     print(
         "\n[окружение] "
@@ -890,7 +1174,8 @@ def diagnose() -> None:
     if os.name != "nt":
         import socket
 
-        sock = f"/tmp/scplay-diag2-{os.getpid()}.sock"
+        sock = ipc_socket_path("scplay-diag2")
+        cleanup_socket(sock)
         p = subprocess.Popen(
             [
                 mpv,
@@ -927,6 +1212,8 @@ def diagnose() -> None:
         finally:
             if p.poll() is None:
                 p.terminate()
+                p.wait(3)
+            cleanup_socket(sock)
 
     # 2) настоящий путь запуска из программы
     app = ScPlay()
@@ -960,7 +1247,7 @@ def diagnose() -> None:
     alive()
 
     def play_local():
-        wav = Path(os.environ.get("TMPDIR", "/tmp")) / f"scplay_diag_{os.getpid()}.wav"
+        wav = Path(tempfile.gettempdir()) / f"scplay_diag_{os.getpid()}.wav"
         subprocess.run(
             [
                 "ffmpeg",
@@ -1007,21 +1294,24 @@ def diagnose() -> None:
 
     # анализатор (ffmpeg) на локальном файле
     def analyzer_test():
-        wav = Path(os.environ.get("TMPDIR", "/tmp")) / f"scplay_diag_{os.getpid()}.wav"
+        wav = Path(tempfile.gettempdir()) / f"scplay_diag_{os.getpid()}.wav"
         a = Analyzer(str(wav), 6)
         for _ in range(30):
             if a.done:
                 break
             time.sleep(0.1)
-        n = a.n
+        decoded, blocks = a.n, a.nbd
         a.stop()
-        if n < 1000:
-            raise RuntimeError(f"ffmpeg декодировал только {n} сэмплов")
-        return f"{n} сэмплов"
+        if decoded < 1000:
+            raise RuntimeError(f"ffmpeg декодировал только {decoded} сэмплов")
+        if blocks < 10:
+            raise RuntimeError("огибающая волны не собралась")
+        return f"{decoded} сэмплов, {blocks} блоков волны"
 
     if ok_local:
         step("анализатор (ffmpeg → numpy) для визуализатора", analyzer_test)
     app.stop_mpv()
+    print(f"\n[логи] {DEBUG_LOG}")
     print("\n[тексты песен] проверка lrclib.net")
     try:
         res = http_get_json("search", {"track_name": "test"}, timeout=10)
@@ -1167,6 +1457,14 @@ class ScPlay(App):
         self._mpv_starting = False
         self._mpv_dead = False
         self._mpv_retry_gen = -1
+        self._mpv_gen = 0  # поколение процесса mpv: старые колбэки должны замолчать
+        self._quitting_gen = -1  # поколение, завершаемое нашими руками
+        self._sock: str | None = None
+        self._shutdown_done = False
+        # управление извне: локальный канал + системная медиа-сессия
+        self.control: ControlServer | None = None
+        self.media = None  # создаётся в on_mount: медиа-фреймворки трогаем только в главном потоке
+        self.media_wanted = bool(self.cfg.get("media", True))
         self._eof_detail = ""
         # подготовка следующего трека
         self.cache: dict[str, tuple[float, dict]] = {}
@@ -1259,11 +1557,168 @@ class ScPlay(App):
         self.refill()
         self.set_interval(1 / 20, self.tick)
         self._ui_ready = True
+        self.start_control()
+        # медиа-сессию создаём в главном потоке: MediaPlayer.framework этого требует
+        if self.media_wanted:
+            self.media = make_media(on_command=self.media_command, on_position=self.media_position)
         self.start_mpv()
         if self.initial:
             self.start_initial(self.initial)
         else:
             self.notice("Нажми /, чтобы найти музыку, или 2 — открыть свои лайки", 8)
+
+    # ---------- управление извне (канал + медиа-сессия)
+    def start_control(self) -> None:
+        """Поднимает локальный канал: scplay --send / --status и внешние скрипты."""
+        server = ControlServer(self._control_dispatch)
+        error = server.start()
+        if error:
+            # сервер не наш: не оставляем объект, иначе shutdown() снесёт
+            # сокет уже работающего экземпляра scplay
+            dbg(f"канал управления не поднялся: {error}")
+            server.stop()
+            self.control = None
+            self.notice(error, 8)
+            return
+        self.control = server
+
+    def media_command(self, action: str) -> None:
+        """Команда от медиа-клавиш. Вызывается из медиа-потока, поэтому в очередь."""
+        dbg(f"медиа: команда {action}")
+        self.call_from_thread(self.media_command_ui, action)
+
+    def media_position(self, seconds: float) -> None:
+        self.call_from_thread(lambda: self.seek_to(seconds))
+
+    def media_command_ui(self, action: str) -> None:
+        {"toggle": self.action_pause, "play": self._media_play, "pause": self._media_pause,
+         "next": self.action_next, "prev": self.action_prev}.get(action, lambda: None)()
+
+    def _media_play(self) -> None:
+        if self.state == "playing" and self.paused:
+            self.action_pause()
+
+    def _media_pause(self) -> None:
+        if self.state == "playing" and not self.paused:
+            self.action_pause()
+
+    def publish_media(self, position: float | None = None) -> None:
+        """Обновляет системную медиа-сессию. Только из потока интерфейса."""
+        if not self.media:
+            return
+        try:
+            if position is not None:
+                self.media.set_position(position)
+            else:
+                self.media.set_state(self.state == "playing", self.paused)
+        except Exception as e:
+            dbg(f"медиа: публикация не удалась: {e!r}")
+
+    def _control_dispatch(self, line: str) -> dict:
+        """Выполняет команду канала в потоке интерфейса и возвращает ответ.
+
+        Вызывается из потока сервера, поэтому сама работа уходит в главный поток
+        через call_from_thread, а здесь только ожидание результата.
+        """
+        done = threading.Event()
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["reply"] = self.control_command(line)
+            except Exception as e:
+                box["reply"] = {"ok": False, "error": str(e)}
+            finally:
+                done.set()
+
+        self.call_from_thread(run)
+        if not done.wait(5.0):
+            return {"ok": False, "error": "интерфейс не ответил вовремя"}
+        return box.get("reply") or {"ok": False, "error": "нет ответа"}
+
+    def status_payload(self) -> dict:
+        tr = self.current or {}
+        return {
+            "ok": True,
+            "state": "paused" if (self.state == "playing" and self.paused) else self.state,
+            "title": tr.get("title"),
+            "uploader": tr.get("uploader"),
+            "position": round(self.position(), 1),
+            "duration": round(self.duration or 0, 1),
+            "volume": self.volume,
+            "shuffle": self.shuffle,
+            "repeat": self.repeat,
+            "repeat_name": REPEAT_NAMES[self.repeat],
+            "queue_len": len(self.queue),
+            "queue_index": self.idx + 1 if self.idx >= 0 else 0,
+            "next_ready": bool(self.mpv_next_url),
+            "track_url": tr.get("url"),
+            "media_backend": self.media.name if self.media else "нет",
+        }
+
+    def control_command(self, line: str) -> dict:
+        """Одна команда канала управления. Возвращает ответ для CLI."""
+        parts = line.split()
+        cmd, args = parts[0].lower(), parts[1:]
+
+        def num(i: int, default: float = 0.0) -> float:
+            try:
+                return float(args[i])
+            except (IndexError, ValueError):
+                return default
+
+        if cmd == "status":
+            return self.status_payload()
+        if cmd == "queue":
+            return {
+                "ok": True,
+                "result": [
+                    {"index": i + 1, "title": t.get("title"), "uploader": t.get("uploader"),
+                     "playing": i == self.idx, "url": t.get("url")}
+                    for i, t in enumerate(self.queue)
+                ],
+            }
+        if cmd == "toggle":
+            self.action_pause()
+        elif cmd == "play":
+            self._media_play()
+        elif cmd == "pause":
+            self._media_pause()
+        elif cmd == "next":
+            self.action_next()
+        elif cmd == "prev":
+            self.action_prev()
+        elif cmd == "seek":
+            self.seek_to(num(0))
+        elif cmd == "seek-rel":
+            self.action_seek(num(0))
+        elif cmd == "volume":
+            self.action_volume(int(num(0)) - self.volume)
+        elif cmd == "volume-rel":
+            self.action_volume(int(num(0)))
+        elif cmd == "shuffle":
+            self.action_shuffle()
+        elif cmd == "repeat":
+            self.action_repeat()
+        elif cmd == "theme":
+            self.action_theme()
+        elif cmd == "lyrics":
+            self.action_lyrics()
+        elif cmd == "quit":
+            # action_quit_app — корутина: call_later() её не запустит, поэтому
+            # синхронный выход вызываем напрямую (проверено: иначе процесс висел)
+            self.shutdown()
+            self.exit()
+        else:
+            return {
+                "ok": False,
+                "error": f"неизвестная команда {cmd!r}",
+                "commands": sorted(COMMANDS),
+            }
+        # отдаём актуальное состояние, чтобы CLI мог показать результат
+        payload = self.status_payload()
+        payload["message"] = f"{cmd}: выполнено"
+        return payload
 
     # ---------- mpv
     @work(thread=True)
@@ -1281,10 +1736,11 @@ class ScPlay(App):
     def _spawn_mpv(self):
         """Пробует режимы запуска по очереди. Возвращает (MPV | None, ошибка | None)."""
         exe = shutil.which("mpv") or "mpv"
-        nt = os.name == "nt"
-        sock = f"scplay-{os.getpid()}" if nt else f"/tmp/scplay-{os.getpid()}.sock"
+        sock = ipc_socket_path()
+        self._sock = sock
+        self.cleanup_sock()
         try:
-            MPV_LOG.parent.mkdir(parents=True, exist_ok=True)
+            secure_dir(CONFIG_DIR)
             log = open(MPV_LOG, "wb")
         except OSError:
             log = subprocess.DEVNULL
@@ -1302,6 +1758,7 @@ class ScPlay(App):
             )
             if m:
                 self.mpv_profile = name
+                dbg(f"mpv: запущен режим «{name}», pid={self.mpv_proc.pid if self.mpv_proc else '?'}")
                 return m, None
             attempts.append(err)
             if fatal:
@@ -1310,8 +1767,8 @@ class ScPlay(App):
             if log is not subprocess.DEVNULL:
                 log.write(("\n".join(attempts) + "\n").encode())
                 log.flush()
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"mpv: не удалось дописать {MPV_LOG}: {e!r}")
         sig = next(
             (
                 w.strip("),:")
@@ -1347,6 +1804,8 @@ class ScPlay(App):
                 os.remove(sock)
             except OSError:
                 pass
+        self._mpv_gen += 1
+        gen = self._mpv_gen
         cmd = [exe, *args, f"--volume={self.volume}", f"--input-ipc-server={sock}"]
         try:
             kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if nt else {}
@@ -1359,8 +1818,12 @@ class ScPlay(App):
                 **kw,
             )
         except OSError as e:
+            dbg(f"mpv: не удалось запустить {exe}: {e!r}")
             return None, f"mpv не найден или не запускается: {e}", True
         self.mpv_proc = proc
+        # mpv с --idle=yes переживёт аварийное завершение scplay и останется
+        # держать звуковое устройство, поэтому за ним присматривает watchdog
+        watch_parent(proc)
         try:
             from python_mpv_jsonipc import _ipc_endpoint_ready as ready_fn
         except ImportError:
@@ -1385,7 +1848,7 @@ class ScPlay(App):
                     m = MPV(
                         start_mpv=False,
                         ipc_socket=sock,
-                        quit_callback=self._on_mpv_quit,
+                        quit_callback=lambda g=gen: self._on_mpv_quit(g),
                     )
                 except Exception as e:
                     last_err = e
@@ -1398,14 +1861,14 @@ class ScPlay(App):
                     for opt in ("prefetch-playlist", "gapless-audio"):
                         try:
                             m.command("set_property", opt, "yes")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            dbg(f"mpv: настройка {opt} не применилась: {e!r}")
                     return m, None, False
             time.sleep(0.15)
         try:
             proc.kill()
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"mpv: не удалось убить зависший процесс: {e!r}")
         return (
             None,
             f"[{name}] не удалось подключиться к IPC: {last_err or 'таймаут'}",
@@ -1424,21 +1887,33 @@ class ScPlay(App):
         except OSError:
             return ""
 
-    def _on_mpv_quit(self) -> None:
-        if not getattr(self, "_quitting", False):
-            self._mpv_dead = True
+    def _on_mpv_quit(self, gen: int = -1) -> None:
+        """mpv умер сам. Наш собственный 'quit' смертью не считается.
+
+        Раньше здесь стоял обычный флаг _quitting, который выставлялся при остановке
+        и уже никогда не сбрасывался: после первого перезапуска mpv приложение
+        перестало замечать его падения. Теперь сравниваем поколения процессов.
+        """
+        if gen == self._quitting_gen:
+            return
+        dbg(f"mpv: процесс поколения {gen} завершился сам")
+        self._mpv_dead = True
+
+    def cleanup_sock(self) -> None:
+        cleanup_socket(self._sock or "")
 
     def stop_mpv(self) -> None:
-        self._quitting = True
+        """Останавливает mpv и убирает за ним сокет. Идемпотентно."""
+        self._quitting_gen = self._mpv_gen
         try:
             if self.mpv:
                 try:
                     self.mpv.command("quit")
-                except Exception:
-                    pass
+                except Exception as e:
+                    dbg(f"mpv: команда quit не прошла: {e!r}")
                 self.mpv.terminate()
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"mpv: ошибка остановки: {e!r}")
         p = self.mpv_proc
         if p and p.poll() is None:
             p.terminate()
@@ -1446,6 +1921,30 @@ class ScPlay(App):
                 p.wait(1.5)
             except Exception:
                 p.kill()
+        self.cleanup_sock()
+
+    def shutdown(self) -> None:
+        """Полное завершение: настройки, анализаторы, mpv, сокет, канал и медиа."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        try:
+            self.save_state()
+        except Exception as e:
+            dbg(f"выход: настройки не сохранились: {e!r}")
+        if self.analyzer:
+            self.analyzer.stop()
+        self.stop_next_analyzer()
+        self.stop_mpv()
+        if self.control:
+            self.control.stop()
+            self.control = None
+        if self.media:
+            try:
+                self.media.stop()
+            except Exception as e:
+                dbg(f"медиа: остановка не удалась: {e!r}")
+            self.media = None
 
     def _obs_pos(self, name, v):
         if v is not None:
@@ -1554,6 +2053,7 @@ class ScPlay(App):
         name = VIEWS[i]
         again = name == self.view
         if self.view != "lyrics" and name == "lyrics":
+            # запоминаем, откуда пришли: после «l» вернёмся именно туда
             self.prev_view = self.view
         self.view = name
         self.refill(reset=True)
@@ -1577,14 +2077,16 @@ class ScPlay(App):
         self.call_from_thread(self.notice, "Загружаю…", 30)
         try:
             items = profile_list(self.cfg, name, 100)
-        except Exception:
+        except Exception as e:
+            dbg(f"список {name}: profile_list не сработал ({e!r}), пробую обычный путь")
             try:  # запасной путь: без автора и длительности
                 items = extract_list(
                     self.cfg["profile"].rstrip("/") + suffix, self.cfg, 100
                 )
-            except Exception as e:
+            except Exception as e2:
+                dbg(f"список {name}: запасной путь тоже не сработал: {e2!r}")
                 self.call_from_thread(
-                    self.notice, f"Ошибка загрузки: {clip(str(e), 80)}", 8
+                    self.notice, f"Ошибка загрузки: {clip(str(e2), 80)}", 8
                 )
                 return
         self.call_from_thread(self.set_list, name, items)
@@ -1641,6 +2143,7 @@ class ScPlay(App):
         try:
             items = extract_list(f"scsearch25:{q}", self.cfg, 25)
         except Exception as e:
+            dbg(f"поиск «{q}»: {e!r}")
             self.call_from_thread(self.notice, f"Ошибка поиска: {clip(str(e), 80)}", 8)
             return
         self.call_from_thread(self.set_list, "search", items)
@@ -1683,7 +2186,9 @@ class ScPlay(App):
             self.cfg["profile"] = me["permalink_url"]
             self.cfg["username"] = me.get("username")
         else:
+            # без этого в шапке оставалось имя прошлого аккаунта
             self.cfg.pop("profile", None)
+            self.cfg.pop("username", None)
         save_cfg(self.cfg)
         self.loaded.clear()
         if self.cfg.get("profile"):
@@ -1700,7 +2205,7 @@ class ScPlay(App):
 
     # ---------- запуск воспроизведения
     def start_initial(self, arg: str) -> None:
-        if os.path.exists(arg):
+        if os.path.isfile(arg):
             tr = {
                 "title": Path(arg).name,
                 "uploader": "локальный файл",
@@ -1724,6 +2229,7 @@ class ScPlay(App):
         try:
             items = get_tracks(self.cfg, url)
         except Exception as e:
+            dbg(f"ссылка {url}: {e!r}")
             self.call_from_thread(
                 self.notice, f"Не удалось открыть: {clip(str(e), 80)}", 8
             )
@@ -1783,6 +2289,7 @@ class ScPlay(App):
         try:
             info = resolve_stream(track, self.cfg)
         except Exception as e:
+            dbg(f"resolve «{track.get('title')}» ({track.get('url')}): {e!r}")
             self.call_from_thread(self.on_load_error, gen, e)
             return
         self.cache_put(track, info)
@@ -1792,8 +2299,9 @@ class ScPlay(App):
         if gen != self.gen:
             return
         self._errors += 1
+        cur = self.current or {}
         self.notice(
-            f"Не удалось загрузить «{clip(self.current['title'], 30)}»: {clip(str(err), 60)}",
+            f"Не удалось загрузить «{clip(cur.get('title', '?'), 30)}»: {clip(str(err), 60)}",
             8,
         )
         if self._errors < 3:
@@ -1848,6 +2356,15 @@ class ScPlay(App):
         self.refill()
         self.lyr = self._new_lyr(track["url"], "pending")
         self.lyr_offset = 0.0
+        if self.media:
+            try:
+                self.media.set_track(
+                    self.current.get("title") or "?", self.current.get("uploader") or "",
+                    "scplay", self.duration,
+                )
+                self.media.set_state(True, False)
+            except Exception as e:
+                dbg(f"медиа: трек не опубликован: {e!r}")
         delay = (
             0.05 if self.view == "lyrics" else 1.5
         )  # при быстром листании не дёргаем сервис
@@ -1864,11 +2381,12 @@ class ScPlay(App):
         if self.analyzer:
             self.analyzer.stop()
             self.analyzer = None
+        self.publish_media()
         try:
             if self.mpv:
                 self.mpv.command("stop")
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"mpv: команда stop не прошла: {e!r}")
         self.refill()
 
     # ---------- тексты песен
@@ -1899,6 +2417,7 @@ class ScPlay(App):
         try:
             data = get_lyrics(track)
         except Exception as e:
+            dbg(f"текст «{track.get('title')}»: {e!r}")
             data = {"status": "error", "error": str(e)}
         self.call_from_thread(self._lyrics_done, track["url"], data)
 
@@ -2042,8 +2561,10 @@ class ScPlay(App):
     def prefetch_worker(self, gen: int, nxt: int, track: dict) -> None:
         try:
             info = resolve_stream(track, self.cfg)
-        except Exception:
-            return  # ошибку покажет обычная загрузка
+        except Exception as e:
+            # ошибку покажет обычная загрузка, но в логе она быть должна
+            dbg(f"префетч «{track.get('title')}»: {e!r}")
+            return
         self.cache_put(track, info)
         self.call_from_thread(self._prefetch_done, gen, nxt, info)
 
@@ -2061,11 +2582,16 @@ class ScPlay(App):
         url = info["url"]
         if not self.mpv or self.mpv_next_url == url:
             return
+        if self.mpv_next_url:
+            # в плейлисте mpv лежит уже не тот трек (кэш устарел, очередь изменилась).
+            # playlist-clear идёт первым, иначе mpv может уйти на устаревший трек.
+            dbg("префетч: заменяю заранее добавленный трек")
         try:
             self.mpv.command("playlist-clear")
             self.mpv.command("loadfile", url, "append")
             self.mpv_next_url = url
-        except Exception:
+        except Exception as e:
+            dbg(f"префетч: mpv не принял следующий трек: {e!r}")
             self.mpv_next_url = None
             return
         if not (self.next_analyzer and self.next_analyzer[0] == url):
@@ -2076,8 +2602,8 @@ class ScPlay(App):
         if self.mpv_next_url and self.mpv:
             try:
                 self.mpv.command("playlist-clear")
-            except Exception:
-                pass
+            except Exception as e:
+                dbg(f"префетч: не удалось очистить плейлист mpv: {e!r}")
         self.mpv_next_url = None
         self.stop_next_analyzer()
 
@@ -2089,8 +2615,9 @@ class ScPlay(App):
         self.paused = not self.paused
         try:
             self.mpv.pause = self.paused
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"пауза не применилась: {e!r}")
+        self.publish_media()
 
     def seek_to(self, t: float) -> None:
         if self.state != "playing" or not self.mpv:
@@ -2100,7 +2627,8 @@ class ScPlay(App):
         t = max(t, 0.0)
         try:
             self.mpv.command("seek", t, "absolute")
-        except Exception:
+        except Exception as e:
+            dbg(f"перемотка на {t:.1f}с не удалась: {e!r}")
             return
         self._pos, self._pos_t = t, time.monotonic()
 
@@ -2122,17 +2650,26 @@ class ScPlay(App):
         try:
             if self.mpv:
                 self.mpv.volume = self.volume
-        except Exception:
-            pass
+        except Exception as e:
+            dbg(f"громкость {self.volume} не применилась: {e!r}")
+        self.save_state()
+
+    def save_state(self) -> None:
+        """Сохраняет громкость/шаффл/повтор сразу: раньше они терялись, если
+        выйти не через q (Ctrl-C, закрытое окно терминала)."""
+        self.cfg.update(volume=self.volume, shuffle=self.shuffle, repeat=self.repeat)
+        save_cfg(self.cfg)
 
     def action_shuffle(self) -> None:
         self.shuffle = not self.shuffle
         self.invalidate_prefetch()
+        self.save_state()
         self.notice("Шаффл: " + ("вкл" if self.shuffle else "выкл"), 3)
 
     def action_repeat(self) -> None:
         self.repeat = (self.repeat + 1) % 3
         self.invalidate_prefetch()
+        self.save_state()
         self.notice("Повтор: " + REPEAT_NAMES[self.repeat], 3)
 
     def action_enqueue(self) -> None:
@@ -2185,12 +2722,7 @@ class ScPlay(App):
         self.refill()
 
     async def action_quit_app(self) -> None:
-        self.cfg.update(volume=self.volume, shuffle=self.shuffle, repeat=self.repeat)
-        save_cfg(self.cfg)
-        if self.analyzer:
-            self.analyzer.stop()
-        self.stop_next_analyzer()
-        self.stop_mpv()
+        self.shutdown()
         self.exit()
 
     def check_action(self, action: str, parameters) -> bool | None:
@@ -2205,12 +2737,13 @@ class ScPlay(App):
         if self._mpv_dead:
             self._mpv_dead = False
             self.mpv = None
-            rc = None
-            if self.mpv_proc:
+            rc = self.mpv_proc.poll() if self.mpv_proc else None
+            if rc is None and self.mpv_proc:
                 try:
-                    rc = self.mpv_proc.wait(0.5)
+                    rc = self.mpv_proc.wait(0.5)  # даём процессу дописать код возврата
                 except Exception:
-                    rc = self.mpv_proc.poll()
+                    rc = None
+            dbg(f"mpv: замечена смерть процесса (rc={rc}), останавливаю воспроизведение")
             why = f" ({describe_exit(rc)})" if rc not in (None, 0) else ""
             self.mpv_error = (
                 f"mpv завершился{why} — Enter на треке перезапустит; "
@@ -2244,6 +2777,7 @@ class ScPlay(App):
                     self._handoff_ok = False
         if self._frame % 10 == 0:
             self._maybe_prefetch()
+            self.publish_media(self.position())
         spec = self.query_one("#spec")
         nb = self.bars_for(spec.size.width)
         new = None
@@ -2363,7 +2897,7 @@ class ScPlay(App):
                 style = P["faint"]
             elif idx == c:
                 style = f"bold {P['accent2']}"
-            elif idx == c + 1 and c >= 0 or (c < 0 and idx == 0):
+            elif (idx == c + 1 and c >= 0) or (c < 0 and idx == 0):
                 style = P["text"]
             elif idx > c:
                 style = P["dim"]
@@ -2538,13 +3072,79 @@ class ScPlay(App):
         return Text("\n").join(out)
 
 
+def _parse_args(argv: list[str]):
+    """Разбирает свои флаги, остальное возвращает как есть (запрос для поиска).
+
+    parse_known_args нужен, чтобы «scplay daft punk --help» искал по строке целиком,
+    а не падал на неизвестном флаге.
+    """
+    parser = argparse.ArgumentParser(
+        prog="scplay",
+        add_help=False,
+        allow_abbrev=False,
+        usage="scplay [флаг] [запрос | ссылка | файл]",
+        description="SoundCloud в терминале: поиск, лайки, плейлисты, визуализатор и волна.",
+        epilog=(
+            "примеры:\n"
+            "  scplay                      открыть интерфейс\n"
+            "  scplay lofi hip hop         сразу искать\n"
+            "  scplay https://soundcloud.com/...   играть ссылку\n"
+            "  scplay song.mp3             играть локальный файл\n"
+            "  scplay --diagnose           проверить mpv, ffmpeg и поток"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-h", "--help", action="store_true", help="показать эту справку")
+    parser.add_argument("-V", "--version", action="store_true", help="показать версию")
+    parser.add_argument("-d", "--diagnose", action="store_true", help="диагностика окружения")
+    parser.add_argument(
+        "-s", "--send", action="store_true",
+        help="отправить команду запущенному scplay (next, toggle, volume 60, seek-rel -5, …)",
+    )
+    parser.add_argument(
+        "--status", action="store_true", help="состояние запущенного scplay"
+    )
+    ns, rest = parser.parse_known_args(argv)
+    if ns.help:
+        parser.print_help()
+        print("\nкоманды для --send (аргументы после флага передаются команде):")
+        for name, help_text in COMMANDS.items():
+            print(f"  {name:14} {help_text}")
+        sys.exit(0)
+    return ns, rest
+
+
 def main() -> None:
-    if sys.argv[1:] == ["--diagnose"]:
+    ns, rest = _parse_args(sys.argv[1:])
+    if ns.version:
+        print(f"scplay {__version__} · python {platform.python_version()} · yt-dlp {yt_dlp.version.__version__}")
+        return
+    if ns.diagnose:
         return diagnose()
-    initial = " ".join(sys.argv[1:]).strip() or None
+    if ns.status or ns.send:
+        # аргументы после --send уходят команде целиком: иначе argparse съедает
+        # отрицательные значения вроде «volume-rel -5»
+        return run_cli(rest + (["status"] if ns.status else []))
+    if rest and rest[0].startswith("-") and len(rest[0]) > 1 and not os.path.exists(rest[0]):
+        # скорее всего опечатка в флаге, а не поисковый запрос
+        print(f"scplay: неизвестный флаг {rest[0]!r} (справка: scplay --help)", file=sys.stderr)
+        sys.exit(2)
+    require_tools()
+    install_crash_handlers()
+    initial = " ".join(rest).strip() or None
     app = ScPlay(initial)
-    atexit.register(app.stop_mpv)
-    app.run()
+    try:
+        app.run()
+    except BaseException as e:  # в том числе KeyboardInterrupt
+        try:
+            with CRASH_LOG.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} выход из интерфейса ===\n")
+                fh.write("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+        except Exception:
+            pass
+        raise
+    finally:
+        app.shutdown()
 
 
 if __name__ == "__main__":

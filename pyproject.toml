@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scplay"
-version = "0.3.0"
+version = "0.4.0"
 description = "SoundCloud в терминале: поиск, лайки, плейлисты, визуализатор и волна"
 readme = "README.md"
 license = "MIT"
@@ -23,8 +23,13 @@ dependencies = [
     "python-mpv-jsonipc>=1.2",
 ]
 
+[project.optional-dependencies]
+# MPRIS для Linux (медиа-клавиши и панель плеера). На macOS не нужен: там
+# «сейчас играет» работает через MediaPlayer.framework без зависимостей.
+mpris = ["dbus-next"]
+
 [project.scripts]
 scplay = "scplay:main"
 
 [tool.setuptools]
-py-modules = ["scplay"]
+py-modules = ["scplay", "scplay_media"]
